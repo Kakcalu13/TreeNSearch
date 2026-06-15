@@ -171,6 +171,21 @@ namespace tns
 		void run();
 
 		/**
+		 * @brief Executes the neighborhood search on the GPU (Apple Metal) and builds the neighborlists.
+		 * The result is identical to `run()`; only the backend differs. The neighborlists are accessed
+		 * through the same `get_neighborlist()` / `for_each_neighbor()` interface.
+		 *
+		 * @return true if the search ran on the GPU. If Metal is unavailable or the problem is out of
+		 * the supported range, it returns false and transparently falls back to the CPU `run()`.
+		*/
+		bool run_gpu();
+
+		/**
+		 * @return true if a usable Metal GPU device is present on this machine.
+		*/
+		static bool is_gpu_available();
+
+		/**
 		 * @brief Returns a handle to the neighborlist in set_j of a point_i from point set_i.
 		 * 
 		 * @param set_i Set id of the point searching.
@@ -394,6 +409,9 @@ namespace tns
 		// Neighborlist solution
 		std::vector<internals::chunked_vector<int, 262144>> thread_neighborlists; // Neighborlist data. Each thread keeps its own lists.
 		std::vector<std::vector<int*>> solution_ptr;  // Pointers to the solution neighborlists. Indexing: [set_i*n_sets + set_j][particle_i] -> [n_neighbors, neighbor_0, neighbor_1, ..., neighbor_n]
+		std::vector<std::vector<int>> gpu_solution_data;  // Backing storage for the GPU path, one packed buffer per set pair. solution_ptr points into it.
+		std::vector<float> gpu_points_scratch;  // Reused across run_gpu() calls (concatenated xyz) to avoid per-step allocation.
+		std::vector<float> gpu_radii_scratch;   // Reused across run_gpu() calls (per-point radius).
 
 		// Octree / Grid
 		float cell_size = -1.0f;
