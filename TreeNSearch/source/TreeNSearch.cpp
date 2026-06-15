@@ -14,6 +14,10 @@
 
 #include "internals/shuffle_lut.h"
 
+#if defined(__APPLE__)
+	#include "internals/metal_nsearch.h"
+#endif
+
 using namespace tns::internals;
 
 
@@ -162,6 +166,139 @@ void tns::TreeNSearch::run_scalar()
 	this->_build_octree_and_gather_leaves();
 	this->_solve_leaves(/* use_simd = */ false);
 	this->are_cells_valid = true;
+}
+bool tns::TreeNSearch::is_gpu_available()
+{
+#if defined(__APPLE__)
+	return tns::internals::metal_is_available();
+#else
+	return false;
+#endif
+}
+bool tns::TreeNSearch::run_gpu()
+{
+#if defined(__APPLE__)
+	// Small problems are not worth a GPU round-trip; the CPU path is faster.
+	if (this->get_total_n_points() < this->number_of_too_few_particles) {
+		this->run_scalar();
+		return false;
+	}
+
+	this->_set_up();   // casts double->float, defaults cell_size, builds active_searches, etc.
+	this->_check();
+	this->_clear_neighborlists();
+
+	const int total = this->get_total_n_points();
+
+	// ── Concatenate point coordinates and build a per-point radius array ──────
+	// Reuse scratch buffers across calls (the SPH loop calls run_gpu() every step).
+	this->gpu_points_scratch.resize(3 * (size_t)total);
+	this->gpu_radii_scratch.resize((size_t)total);
+	std::vector<float>& points = this->gpu_points_scratch;
+	std::vector<float>& radii = this->gpu_radii_scratch;
+	float max_radius = 0.0f;
+	for (int set_i = 0; set_i < this->n_sets; set_i++) {
+		const int n = this->get_n_points_in_set(set_i);
+		const int base = this->set_offsets[set_i];
+		std::memcpy(points.data() + 3 * (size_t)base, this->set_points[set_i], sizeof(float) * 3 * (size_t)n);
+		if (this->is_global_search_radius_set) {
+			for (int i = 0; i < n; i++) { radii[base + i] = this->global_search_radius; }
+			max_radius = std::max(max_radius, this->global_search_radius);
+		}
+		else {
+			for (int i = 0; i < n; i++) {
+				const float r = this->set_radii[set_i][i];
+				radii[base + i] = r;
+				max_radius = std::max(max_radius, r);
+			}
+		}
+	}
+
+	// ── Bounding box of all points ────────────────────────────────────────────
+	float mn[3] = { std::numeric_limits<float>::max(),  std::numeric_limits<float>::max(),  std::numeric_limits<float>::max() };
+	float mx[3] = { std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest() };
+	for (int p = 0; p < total; p++) {
+		for (int d = 0; d < 3; d++) {
+			const float v = points[3 * (size_t)p + d];
+			mn[d] = std::min(mn[d], v);
+			mx[d] = std::max(mx[d], v);
+		}
+	}
+
+	// ── Background grid ─────────────────────────────────────────────────────────
+	internals::MetalSearchRequest req;
+	req.points = points.data();
+	req.radii = radii.data();
+	req.total_points = total;
+	req.n_sets = this->n_sets;
+	req.set_offsets = this->set_offsets;
+	req.symmetric = this->symmetric_search;
+	// Fast path when every point shares one radius and there is a single set (SPH fluid).
+	req.uniform_radius = this->is_global_search_radius_set && (this->n_sets == 1);
+	req.radius = this->global_search_radius;
+
+	// The GPU uses its own uniform-grid cell size, independent of the octree's
+	// `cell_size`. For a uniform grid the candidate count is minimised when the
+	// cell equals the (max) search distance, so a 3x3x3 sweep (search_range 1)
+	// is guaranteed to reach every neighbour while keeping the candidate set tight.
+	// Grid refinement: a finer grid (cell = max_radius / refine, sweeping `refine`
+	// cells) tests fewer non-neighbour candidates in the hot loop at the cost of more
+	// cell bookkeeping. refine=1 -> 3x3x3; refine=2 -> 5x5x5 over half-size cells.
+	int refine = 1;
+	if (const char* e = std::getenv("TNS_GRID_REFINE")) { refine = std::atoi(e); if (refine < 1) refine = 1; }
+	const float grid_cell = ((max_radius > 0.0f) ? max_radius : 1.0f) / (float)refine;
+	const float grid_cell_inv = 1.0f / grid_cell;
+	req.cell_size = grid_cell;
+	req.search_range = refine;
+
+	long n_cells = 1;
+	for (int d = 0; d < 3; d++) {
+		req.origin[d] = mn[d];
+		int dim = (int)std::floor((mx[d] - mn[d]) * grid_cell_inv) + 1;
+		if (dim < 1) dim = 1;
+		req.grid_dims[d] = dim;
+		n_cells *= dim;
+	}
+
+	for (int set_i = 0; set_i < this->n_sets; set_i++) {
+		for (int set_j = 0; set_j < this->n_sets; set_j++) {
+			if (this->active_searches_table[set_i][set_j]) {
+				req.pairs.push_back(internals::MetalSearchPair{ set_i, set_j });
+			}
+		}
+	}
+
+	// ── Run on the GPU ─────────────────────────────────────────────────────────
+	internals::MetalSearchResult result;
+	std::string error;
+	const bool ok = internals::metal_neighbor_search(req, result, error);
+	if (!ok) {
+		std::cout << "tns::TreeNSearch::run_gpu: falling back to CPU (" << error << ")." << std::endl;
+		this->run();
+		return false;
+	}
+
+	// ── Assemble solution_ptr from the GPU result ───────────────────────────────
+	// gpu_solution_data owns the packed [count, ids...] runs; solution_ptr points into it.
+	this->gpu_solution_data.assign(this->n_sets * this->n_sets, std::vector<int>());
+	for (MetalPairResult& pr : result.pairs) {
+		const int pair_id = this->_get_set_pair_id(pr.set_i, pr.set_j);
+		const int n = this->get_n_points_in_set(pr.set_i);
+		std::vector<int>& backing = this->gpu_solution_data[pair_id];
+		backing = std::move(pr.block);
+		std::vector<int*>& ptrs = this->solution_ptr[pair_id];
+		ptrs.resize(n);
+		for (int i = 0; i < n; i++) {
+			ptrs[i] = backing.data() + pr.block_offset[i];
+		}
+	}
+
+	this->are_cells_valid = false;  // GPU path does not build the octree cell structure used by zsort
+	return true;
+#else
+	this->run();
+	return false;
+#endif
 }
 void tns::TreeNSearch::set_recursion_cap(const int cap)
 {
@@ -1859,7 +1996,7 @@ void tns::TreeNSearch::_solve_leaves(const bool use_simd)
 	std::transform_inclusive_scan(
 		this->thread_leaves.begin(), this->thread_leaves.end(), thread_leaves_offsets.begin() + 1, std::plus<int>{},
 		[](const std::vector<OctreeNode*>& leaves) { return (int)leaves.size(); }
-	);
+	, 0);
 	const int n_leaves = thread_leaves_offsets.back();
 
 	//// Parallel concatenate
@@ -2662,7 +2799,7 @@ void tns::TreeNSearch::prepare_zsort()
 					const int c = begin_cell + pair.first;
 					return this->cells.offsets[c + 1] - this->cells.offsets[c];
 				}
-			);
+			, 0);
 			
 			// Insert the points indices in order
 			#pragma omp parallel for schedule(static) num_threads(this->n_threads)
