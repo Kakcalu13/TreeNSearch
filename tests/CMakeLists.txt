@@ -21,3 +21,10 @@ set(SOURCE_FILES
    
 add_executable(tests ${SOURCE_FILES})
 target_link_libraries(tests PUBLIC TreeNSearch)
+
+# GPU (Metal) backend validation + benchmark. Apple only.
+if (APPLE)
+	add_executable(gpu_tests gpu_tests.cpp BruteforceNSearch.cpp BruteforceNSearch.h)
+	target_link_libraries(gpu_tests PUBLIC TreeNSearch)
+	target_include_directories(gpu_tests PRIVATE ${CMAKE_SOURCE_DIR}/TreeNSearch/source)
+endif()
