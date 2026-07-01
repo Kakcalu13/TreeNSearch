@@ -24,7 +24,9 @@ target_link_libraries(tests PUBLIC TreeNSearch)
 
 # GPU (Metal) backend validation + benchmark. Apple only.
 if (APPLE)
-	add_executable(gpu_tests gpu_tests.cpp BruteforceNSearch.cpp BruteforceNSearch.h)
-	target_link_libraries(gpu_tests PUBLIC TreeNSearch)
+	add_executable(gpu_tests gpu_tests.cpp gpu_resident_check.mm BruteforceNSearch.cpp BruteforceNSearch.h)
+	target_link_libraries(gpu_tests PUBLIC TreeNSearch)   # Metal/Foundation inherited (PUBLIC)
 	target_include_directories(gpu_tests PRIVATE ${CMAKE_SOURCE_DIR}/TreeNSearch/source)
+	# ARC for the Objective-C++ resident-solve test (uses __bridge casts).
+	set_source_files_properties(gpu_resident_check.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()

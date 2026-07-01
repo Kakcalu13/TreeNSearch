@@ -154,5 +154,52 @@ namespace internals
 	                          float* out_accel,        // 3n  (may be null)
 	                          int*   out_iterations,   // may be null
 	                          std::string& error);
+
+	// ── GPU-resident SPH solve ───────────────────────────────────────────────────
+	// The functions above take host pointers and drive their own Metal device, so a
+	// caller running an SPH loop pays a host<->device round-trip per phase and a GPU
+	// stall per Jacobi iteration. The entry point below removes both: the caller keeps
+	// particle state in its OWN id<MTLBuffer>s (on a device it shares with us via
+	// metal_sph_set_external_context) and the whole density -> factor -> pressure-solve
+	// runs GPU-resident with batched command buffers.
+
+	// Adopt a caller-supplied Metal device + command queue so caller buffers can be
+	// handed straight to the kernels (no separate device, no marshaling). Pass
+	// id<MTLDevice> / id<MTLCommandQueue> as void* (the header stays pure C++). If
+	// queue is null we create one on the device. Call once before any GPU use; calling
+	// it with a different device than an already-built context rebuilds on the new one.
+	void metal_sph_set_external_context(void* mtlDevice, void* mtlQueue);
+
+	// One GPU-resident constant-density DFSPH solve. All buffer handles are
+	// id<MTLBuffer> passed as void* and must live on the context device (see above).
+	// Convention (same as the host-pointer kernels): pass volume = mass/density0 so the
+	// density kernel yields rest-normalised density (~1 at rest); the constant-density
+	// source then corrects only compression. This is a fluid-only, constant-density solve
+	// (no boundary/rigid term); for static boundaries use the host-pointer pressure path.
+	struct MetalSphGpuRequest {
+		void* points   = nullptr;   // float4/particle (xyz + w), particle order
+		void* velocity = nullptr;   // float3/particle — IN/OUT: XSPH reads + writes it (null => no viscosity)
+		void* volume   = nullptr;   // float/particle = mass/density0 (rest-normalised density), particle order
+		void* outAccel = nullptr;   // float3/particle — pressure accel, written in place
+		int   n = 0;
+		float h = 0.0f;             // support radius (cell size = h)
+		float dt = 0.0f;            // substep timestep
+		float density0 = 1000.0f;
+		float origin[3] = {0,0,0};  // grid min corner
+		int   grid_dims[3] = {1,1,1};
+		int   min_iterations = 1;
+		int   max_iterations = 6;
+		float eta = 0.0f;           // avg density-error threshold; <=0 => run max_iterations
+		float viscosity = 0.0f;     // XSPH velocity-smoothing strength (~0.1-0.3); 0 => off.
+		                            // When >0 and velocity!=null, the solve smooths velocity in place.
+	};
+	// Builds the grid, computes density + DFSPH factor, derives the constant-density
+	// source (relative density clamped >= 1, matching the host caller), runs the
+	// batched Jacobi pressure solve, and writes the final pressure accel into
+	// req.outAccel — all on the GPU, reading/writing the provided buffers. When
+	// req.viscosity > 0 and req.velocity != null, an XSPH velocity-smoothing pass also
+	// runs (after density) and writes the smoothed velocity back into req.velocity in
+	// place. Returns false (with `error` set) if Metal is unavailable or out of bounds.
+	bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error);
 }
 }

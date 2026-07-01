@@ -41,6 +41,7 @@ struct Params {
     float density0;       // rest density (pressure/divergence solve)
     float aij_scale;      // aij_pj multiplier: h^2 (pressure) or h (divergence)
     int   divergence;     // 1 -> divergence mode (s_i=-densityAdv, deficiency cutoff)
+    float viscosity;      // XSPH velocity-smoothing strength (0 = off)
 };
 
 static inline int cell_index(float3 p, constant Params& P)
@@ -760,6 +761,128 @@ kernel void k_pu_nl(device const uint*   nlStart [[buffer(0)]],
     if (P.divergence != 0 && (int)(e - b) < 20) residuum = 0.0f;
     atomic_fetch_add_explicit(errSum, -P.density0 * residuum, memory_order_relaxed);
 }
+
+// ─── GPU-resident constant-density source term ───────────────────────────────
+// densAdv_i = relative density clamped to >= 1 (only compression is corrected);
+// non-finite density -> 1 (rest). Mirrors the host caller's CPU clamp so the
+// resident solve is numerically identical. density holds rho_i/rho0 here.
+kernel void k_densadv_clamp(device const float* density [[buffer(0)]],
+                            device float*       densAdv [[buffer(1)]],
+                            constant Params&    P       [[buffer(2)]],
+                            uint                i       [[thread_position_in_grid]])
+{
+    if ((int)i >= P.nSearch) return;
+    float d = density[i];
+    densAdv[i] = (isfinite(d) && d > 1.0f) ? d : 1.0f;
+}
+
+// ─── Pack the float4 pressure accel into the caller's tight float3 buffer ─────
+kernel void k_accel_copy3(device const float4* accel [[buffer(0)]],
+                          device float*        out3  [[buffer(1)]],
+                          constant Params&     P     [[buffer(2)]],
+                          uint                 i     [[thread_position_in_grid]])
+{
+    if ((int)i >= P.nSearch) return;
+    float3 a = accel[i].xyz;
+    out3[3*i+0] = a.x; out3[3*i+1] = a.y; out3[3*i+2] = a.z;
+}
+
+// ─── XSPH velocity smoothing (viscosity) ─────────────────────────────────────
+// Same grid sweep as k_density, but accumulates Sum_j V_j (v_j - v_i) W and writes
+// v_i' = v_i + viscosity * Sum / rho_i. Reads velIn, writes a SEPARATE velOut so the
+// sweep always sees pre-smoothing velocities. P.r2 = h, density precomputed in `density`.
+kernel void k_xsph(device const float4* points    [[buffer(0)]],
+                   device const float4* sortedPos [[buffer(1)]],
+                   device const float*  volume    [[buffer(2)]],
+                   device const uint*   cellStart [[buffer(3)]],
+                   device const float*  velIn     [[buffer(4)]],  // 3/particle
+                   device const float*  density   [[buffer(5)]],
+                   device float*        velOut    [[buffer(6)]],  // 3/particle
+                   constant Params&     P         [[buffer(7)]],
+                   uint                 i         [[thread_position_in_grid]])
+{
+    if ((int)i >= P.nSearch) return;
+    const float h = P.r2;
+    const float k = 8.0f / (3.14159265358979f * h * h * h);  // CubicKernel m_k
+
+    float3 pi = points[i].xyz;
+    float3 vi = float3(velIn[3*i+0], velIn[3*i+1], velIn[3*i+2]);
+    float3 acc = float3(0.0f);
+
+    int cx = clamp((int)floor((pi.x - P.ox) * P.inv_cs), 0, P.dx - 1);
+    int cy = clamp((int)floor((pi.y - P.oy) * P.inv_cs), 0, P.dy - 1);
+    int cz = clamp((int)floor((pi.z - P.oz) * P.inv_cs), 0, P.dz - 1);
+
+    for (int dz = -1; dz <= 1; dz++) {
+        int ncz = cz + dz; if (ncz < 0 || ncz >= P.dz) continue;
+        for (int dy = -1; dy <= 1; dy++) {
+            int ncy = cy + dy; if (ncy < 0 || ncy >= P.dy) continue;
+            for (int dx = -1; dx <= 1; dx++) {
+                int ncx = cx + dx; if (ncx < 0 || ncx >= P.dx) continue;
+                int lin = (ncz * P.dy + ncy) * P.dx + ncx;
+                uint begin = cellStart[lin];
+                uint end   = cellStart[lin + 1];
+                for (uint s = begin; s < end; s++) {
+                    float4 q = sortedPos[s];
+                    int gid_j = as_type<int>(q.w);
+                    if (gid_j == (int)i) continue;
+                    float r = length(pi - q.xyz);
+                    float qd = r / h;
+                    float w = 0.0f;
+                    if (qd <= 1.0f) {
+                        if (qd <= 0.5f) { float q2 = qd*qd; w = k * (6.0f*q2*qd - 6.0f*q2 + 1.0f); }
+                        else            { float f = 1.0f - qd; w = k * (2.0f*f*f*f); }
+                    }
+                    float3 vj = float3(velIn[3*gid_j+0], velIn[3*gid_j+1], velIn[3*gid_j+2]);
+                    acc += volume[gid_j] * (vj - vi) * w;
+                }
+            }
+        }
+    }
+    float di = max(density[i], 1.0e-6f);
+    float3 vs = vi + P.viscosity * acc / di;
+    velOut[3*i+0] = vs.x; velOut[3*i+1] = vs.y; velOut[3*i+2] = vs.z;
+}
+
+// ─── GPU exclusive prefix-sum of per-cell counts (grid build) ────────────────
+// Single-thread serial scan: writes cellStart[0..nCells] (exclusive prefix; the last
+// element is the grand total) and seeds cellOffset[0..nCells) with the same offsets
+// (the scatter's running cursor). O(nCells) work on one thread — the point is not to
+// parallelise the scan but to keep the grid build entirely GPU-side so hash -> scan ->
+// scatter ride one command buffer with no CPU readback between them. nCells here is
+// ~1e3-1e4, so the serial cost (a few us) is far below the CPU-sync stall it removes.
+kernel void k_scan_cells(device const uint* counts     [[buffer(0)]],
+                         device uint*       cellStart   [[buffer(1)]],
+                         device uint*       cellOffset  [[buffer(2)]],
+                         constant Params&   P           [[buffer(3)]],
+                         uint               tid         [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+    uint acc = 0;
+    int n = P.nCells;
+    for (int c = 0; c < n; c++) { cellStart[c] = acc; cellOffset[c] = acc; acc += counts[c]; }
+    cellStart[n] = acc;
+}
+
+// ─── GPU exclusive prefix-sum for the CSR neighbour list ─────────────────────
+// Exclusive scan of the per-particle neighbour counts (length P.nSearch) into
+// outStart (length nSearch+1; outStart[nSearch] = grand total = number of pairs).
+// Single serial thread — keeps the CSR build GPU-side so k_nl_count -> scan ->
+// k_nl_fill need no CPU readback of the per-particle counts; only the one-word grand
+// total is read back afterwards, to size the pair buffers. Bit-identical to the old
+// CPU scan (same left-to-right uint32 accumulation); nSearch ~ 1e3-1e4.
+kernel void k_exscan(device const uint* count    [[buffer(0)]],
+                     device uint*       outStart [[buffer(1)]],
+                     constant Params&   P        [[buffer(2)]],
+                     uint               tid      [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+    uint acc = 0;
+    int n = P.nSearch;
+    for (int i = 0; i < n; i++) { outStart[i] = acc; acc += count[i]; }
+    outStart[n] = acc;
+}
+
 )METAL";
 
 // ── Cached Metal context ─────────────────────────────────────────────────────
@@ -782,29 +905,44 @@ struct MetalContext {
     id<MTLComputePipelineState> psoNlFill  = nil;
     id<MTLComputePipelineState> psoPaNl    = nil;
     id<MTLComputePipelineState> psoPuNl    = nil;
+    id<MTLComputePipelineState> psoDensadvClamp = nil;
+    id<MTLComputePipelineState> psoAccelCopy3   = nil;
+    id<MTLComputePipelineState> psoXsph         = nil;
+    id<MTLComputePipelineState> psoScanCells    = nil;   // GPU grid prefix-sum
+    id<MTLComputePipelineState> psoExscan       = nil;   // GPU neighbour-list prefix-sum (CSR)
     bool ok = false;
     std::string error;
 };
 
-static MetalContext& context()
+// Optional caller-injected Metal context (the host app's own device + command queue)
+// so the resident solve can bind caller buffers directly. nil => use the default device.
+// Set via metal_sph_set_external_context(); a change forces context() to rebuild.
+static id<MTLDevice>       g_extDevice = nil;
+static id<MTLCommandQueue> g_extQueue  = nil;
+static bool                g_contextNeedsRebuild = false;
+static void reset_buffers();   // defined with the buffer cache below
+
+// Build the device, queue and all compute pipelines into ctx. dev/queue may be nil,
+// in which case the system default device (or first available) and a fresh queue are
+// used. Leaves ctx.ok == false (with ctx.error set) on any failure.
+static void build_context(MetalContext& ctx, id<MTLDevice> dev, id<MTLCommandQueue> queue)
 {
-    static MetalContext ctx;
-    static bool initialized = false;
-    if (initialized) return ctx;
-    initialized = true;
-
+    ctx = MetalContext{};
     @autoreleasepool {
-        ctx.device = MTLCreateSystemDefaultDevice();
+        ctx.device = dev;
         if (ctx.device == nil) {
-            // MTLCreateSystemDefaultDevice() returns nil without a window-server
-            // session (e.g. headless / over SSH); the device is still reachable here.
-            NSArray<id<MTLDevice>>* all = MTLCopyAllDevices();
-            if (all.count > 0) ctx.device = all.firstObject;
+            ctx.device = MTLCreateSystemDefaultDevice();
+            if (ctx.device == nil) {
+                // MTLCreateSystemDefaultDevice() returns nil without a window-server
+                // session (e.g. headless / over SSH); the device is still reachable here.
+                NSArray<id<MTLDevice>>* all = MTLCopyAllDevices();
+                if (all.count > 0) ctx.device = all.firstObject;
+            }
         }
-        if (ctx.device == nil) { ctx.error = "No Metal device available."; return ctx; }
+        if (ctx.device == nil) { ctx.error = "No Metal device available."; return; }
 
-        ctx.queue = [ctx.device newCommandQueue];
-        if (ctx.queue == nil) { ctx.error = "Failed to create Metal command queue."; return ctx; }
+        ctx.queue = queue ? queue : [ctx.device newCommandQueue];
+        if (ctx.queue == nil) { ctx.error = "Failed to create Metal command queue."; return; }
 
         NSError* err = nil;
         NSString* src = [NSString stringWithUTF8String:kKernelSource];
@@ -813,7 +951,7 @@ static MetalContext& context()
         if (lib == nil) {
             ctx.error = std::string("Metal shader compilation failed: ") +
                         (err ? err.localizedDescription.UTF8String : "unknown");
-            return ctx;
+            return;
         }
 
         auto make_pso = [&](const char* name, __strong id<MTLComputePipelineState>& pso) -> bool {
@@ -829,25 +967,40 @@ static MetalContext& context()
             return true;
         };
 
-        if (!make_pso("k_hash",    ctx.psoHash))    return ctx;
-        if (!make_pso("k_scatter", ctx.psoScatter)) return ctx;
-        if (!make_pso("k_count",   ctx.psoCount))   return ctx;
-        if (!make_pso("k_write",   ctx.psoWrite))   return ctx;
-        if (!make_pso("k_scatter_fast", ctx.psoScatterFast)) return ctx;
-        if (!make_pso("k_search_fast",  ctx.psoSearchFast))  return ctx;
-        if (!make_pso("k_compact_fast", ctx.psoCompactFast)) return ctx;
-        if (!make_pso("k_density",      ctx.psoDensity))     return ctx;
-        if (!make_pso("k_factor",       ctx.psoFactor))      return ctx;
-        if (!make_pso("k_density_adv",  ctx.psoDensityAdv))  return ctx;
-        if (!make_pso("k_pressure_accel",  ctx.psoPressureAccel))  return ctx;
-        if (!make_pso("k_pressure_update", ctx.psoPressureUpdate)) return ctx;
-        if (!make_pso("k_nl_count", ctx.psoNlCount)) return ctx;
-        if (!make_pso("k_nl_fill",  ctx.psoNlFill))  return ctx;
-        if (!make_pso("k_pa_nl",    ctx.psoPaNl))    return ctx;
-        if (!make_pso("k_pu_nl",    ctx.psoPuNl))    return ctx;
+        if (!make_pso("k_hash",    ctx.psoHash))    return;
+        if (!make_pso("k_scatter", ctx.psoScatter)) return;
+        if (!make_pso("k_count",   ctx.psoCount))   return;
+        if (!make_pso("k_write",   ctx.psoWrite))   return;
+        if (!make_pso("k_scatter_fast", ctx.psoScatterFast)) return;
+        if (!make_pso("k_search_fast",  ctx.psoSearchFast))  return;
+        if (!make_pso("k_compact_fast", ctx.psoCompactFast)) return;
+        if (!make_pso("k_density",      ctx.psoDensity))     return;
+        if (!make_pso("k_factor",       ctx.psoFactor))      return;
+        if (!make_pso("k_density_adv",  ctx.psoDensityAdv))  return;
+        if (!make_pso("k_pressure_accel",  ctx.psoPressureAccel))  return;
+        if (!make_pso("k_pressure_update", ctx.psoPressureUpdate)) return;
+        if (!make_pso("k_nl_count", ctx.psoNlCount)) return;
+        if (!make_pso("k_nl_fill",  ctx.psoNlFill))  return;
+        if (!make_pso("k_pa_nl",    ctx.psoPaNl))    return;
+        if (!make_pso("k_pu_nl",    ctx.psoPuNl))    return;
+        if (!make_pso("k_densadv_clamp", ctx.psoDensadvClamp)) return;
+        if (!make_pso("k_accel_copy3",   ctx.psoAccelCopy3))   return;
+        if (!make_pso("k_xsph",          ctx.psoXsph))         return;
+        if (!make_pso("k_scan_cells",      ctx.psoScanCells))     return;
+        if (!make_pso("k_exscan",          ctx.psoExscan))        return;
 
         ctx.ok = true;
     }
+}
+
+static MetalContext& context()
+{
+    static MetalContext ctx;
+    static bool initialized = false;
+    if (initialized && !g_contextNeedsRebuild) return ctx;
+    initialized = true;
+    g_contextNeedsRebuild = false;
+    build_context(ctx, g_extDevice, g_extQueue);
     return ctx;
 }
 
@@ -870,6 +1023,7 @@ struct ParamsC {
     float density0;
     float aij_scale;
     int   divergence;
+    float viscosity;   // mirrors Params (MSL); XSPH strength, 0 = off
 };
 
 static void dispatch1d(id<MTLComputeCommandEncoder> enc,
@@ -891,6 +1045,7 @@ struct GpuBuffers {
     id<MTLBuffer> sPoints, sRadii, sSet, sOrig;
     id<MTLBuffer> count, block, blockOff, scratch;
     id<MTLBuffer> volume, density, bVol, bXj, velocity;
+    id<MTLBuffer> velSmooth;                   // XSPH double-buffer (velOut)
     id<MTLBuffer> pRho2, accel, densAdv, factorBuf, err;
     id<MTLBuffer> nlStart, nlId, nlVgw, bVgw;   // precomputed neighbour list for the solve
     std::vector<uint32_t> cellStartHost, nlStartHost;
@@ -905,6 +1060,7 @@ static GpuBuffers& buffers()
 
 static const int kMaxNb = 128;   // must match TNS_MAXNB in the shader
 
+
 // Cached grid params from the most recent build_grid_fast(). Within one solver
 // step the particle positions are fixed across density/factor/solve phases, so the
 // grid (sortedPos + cellStart in the persistent buffers) can be reused instead of
@@ -914,6 +1070,16 @@ static bool    g_gridValid = false;
 // Cached neighbour list (built once per step, shared by the divergence + pressure solves).
 static bool    g_nlValid = false;
 static int     g_nlTotal = 0;
+
+// Drop every cached GPU buffer — used when the Metal device changes (the old buffers
+// belong to the old device). ARC releases them; the next phase reallocates on the new
+// device via ensure(). Also clears the grid/neighbour-list caches.
+static void reset_buffers()
+{
+    buffers() = GpuBuffers{};
+    g_gridValid = false;
+    g_nlValid   = false;
+}
 
 // Grow the buffer only when the requested size exceeds the current allocation.
 static void ensure(id<MTLDevice> dev, __strong id<MTLBuffer>& buf, size_t bytes)
@@ -1496,6 +1662,309 @@ bool metal_pressure_solve(const MetalPressureRequest& req, float* out_accel, int
         }
         if (out_iterations) *out_iterations = iters;
         std::memcpy(req.pressure_rho2, B.pRho2.contents, sizeof(float) * (size_t)N);
+    }
+    return true;
+}
+
+// ── GPU-resident SPH solve ───────────────────────────────────────────────────
+
+void metal_sph_set_external_context(void* mtlDevice, void* mtlQueue)
+{
+    id<MTLDevice>       dev = (__bridge id<MTLDevice>)mtlDevice;
+    id<MTLCommandQueue> q   = (__bridge id<MTLCommandQueue>)mtlQueue;
+    if (dev == g_extDevice && q == g_extQueue) return;   // unchanged
+    g_extDevice = dev;
+    g_extQueue  = q;
+    g_contextNeedsRebuild = true;   // context() recompiles pipelines on the new device
+    reset_buffers();                // cached buffers belonged to the previous device
+}
+
+bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
+{
+    MetalContext& ctx = context();
+    if (!ctx.ok) { error = ctx.error; return false; }
+    const int N = req.n;
+    if (N <= 0) { error = "solve_gpu: n <= 0"; return false; }
+    if (!req.points || !req.volume || !req.outAccel) { error = "solve_gpu: null buffer handle"; return false; }
+
+    const long nCellsL = (long)req.grid_dims[0] * (long)req.grid_dims[1] * (long)req.grid_dims[2];
+    if (nCellsL <= 0 || nCellsL > 300000000L) { error = "solve_gpu: bad grid size"; return false; }
+    const int nCells = (int)nCellsL;
+
+    @autoreleasepool {
+        id<MTLDevice> dev = ctx.device;
+        GpuBuffers& B = buffers();
+        id<MTLBuffer> pts = (__bridge id<MTLBuffer>)req.points;
+        id<MTLBuffer> vol = (__bridge id<MTLBuffer>)req.volume;
+        id<MTLBuffer> out = (__bridge id<MTLBuffer>)req.outAccel;
+        id<MTLBuffer> vel = req.velocity ? (__bridge id<MTLBuffer>)req.velocity : nil;
+        const bool doXsph = (vel != nil && req.viscosity > 0.0f);
+
+        // ── Grid params, shared by every phase ───────────────────────────────────
+        ParamsC P{};
+        P.ox = req.origin[0]; P.oy = req.origin[1]; P.oz = req.origin[2];
+        P.inv_cs = 1.0f / req.h;
+        P.dx = req.grid_dims[0]; P.dy = req.grid_dims[1]; P.dz = req.grid_dims[2];
+        P.R = 1; P.nCells = nCells; P.totalPoints = N; P.nSearch = N; P.r2 = req.h;
+
+        // ── Scratch. The grid prefix-sum moves onto the GPU (k_scan_cells; cellStart
+        //    length nCells+1 is known a priori, so the whole grid build stays GPU-side).
+        //    The neighbour-list prefix-sum also moves onto the GPU (k_exscan), keeping the
+        //    EXACT CSR layout — the only remaining host dependency is one word (the pair
+        //    total nlStart[N]) read back to size nlId/nlVgw, which splits the solve into
+        //    two command buffers (two waits) instead of the old eight. No neighbour cap. ──
+        ensure(dev, B.cellId,     sizeof(uint32_t) * (size_t)N);
+        ensure(dev, B.counts,     sizeof(uint32_t) * (size_t)nCells);
+        ensure(dev, B.cellStart,  sizeof(uint32_t) * (size_t)(nCells + 1));
+        ensure(dev, B.cellOffset, sizeof(uint32_t) * (size_t)nCells);
+        ensure(dev, B.sPoints,    sizeof(float) * 4 * (size_t)N);
+        ensure(dev, B.density,    sizeof(float) * (size_t)N);
+        ensure(dev, B.factorBuf,  sizeof(float) * (size_t)N);
+        ensure(dev, B.densAdv,    sizeof(float) * (size_t)N);
+        ensure(dev, B.pRho2,      sizeof(float) * (size_t)N);
+        ensure(dev, B.accel,      sizeof(float) * 4 * (size_t)N);
+        ensure(dev, B.err,        sizeof(float) * (size_t)N);
+        ensure(dev, B.bVol,       sizeof(float) * (size_t)N);           // unused (no boundary)
+        ensure(dev, B.bXj,        sizeof(float) * 3 * (size_t)N);
+        ensure(dev, B.count,      sizeof(uint32_t) * (size_t)N);
+        ensure(dev, B.nlStart,    sizeof(uint32_t) * (size_t)(N + 1));
+        ensure(dev, B.bVgw,       sizeof(float) * 4 * (size_t)N);
+        // B.nlId / B.nlVgw are sized to the EXACT pair total (nlStart[N]) after CB1's
+        // neighbour-count exclusive scan — a one-word readback, exact CSR, no cap.
+        if (doXsph) ensure(dev, B.velSmooth, sizeof(float) * 3 * (size_t)N);
+
+        // Host-side buffer prep. These writes precede [cmd commit], so the GPU sees them
+        // (shared storage): zero the per-cell counts (hash accumulates), the pressure
+        // (starts at rest) and the density-error accumulator (atomic reduction target).
+        std::memset(B.counts.contents, 0, sizeof(uint32_t) * (size_t)nCells);
+        std::memset(B.pRho2.contents,  0, sizeof(float) * (size_t)N);
+        *(float*)B.err.contents = 0.0f;
+
+        ParamsC Pp = P; Pp.hasBoundary = 0; Pp.viscosity = req.viscosity;   // grid/density/NL build
+        ParamsC Ps = P; Ps.hasBoundary = 0; Ps.dt = req.dt; Ps.density0 = req.density0;
+        Ps.divergence = 0; Ps.aij_scale = req.dt * req.dt;                   // pressure solve (h^2)
+
+        // ── Phase encoders. Each appends encoders to a caller-supplied command buffer;
+        //    Metal serialises compute encoders within one buffer and auto-tracks buffer
+        //    hazards between them, so back-to-back phases need no CPU sync. ──────────────
+
+        // grid: hash (counts pre-zeroed) -> GPU exclusive scan -> scatter into sPoints.
+        auto enc_grid = [&](id<MTLCommandBuffer> cmd){
+            id<MTLComputeCommandEncoder> eh = [cmd computeCommandEncoder];
+            [eh setBuffer:pts offset:0 atIndex:0];
+            [eh setBuffer:B.cellId offset:0 atIndex:1];
+            [eh setBuffer:B.counts offset:0 atIndex:2];
+            [eh setBytes:&P length:sizeof(P) atIndex:3];
+            dispatch1d(eh, ctx.psoHash, (NSUInteger)N);
+            [eh endEncoding];
+            id<MTLComputeCommandEncoder> es = [cmd computeCommandEncoder];   // counts -> cellStart(+seed cellOffset)
+            [es setBuffer:B.counts offset:0 atIndex:0];
+            [es setBuffer:B.cellStart offset:0 atIndex:1];
+            [es setBuffer:B.cellOffset offset:0 atIndex:2];
+            [es setBytes:&P length:sizeof(P) atIndex:3];
+            dispatch1d(es, ctx.psoScanCells, 1);   // single serial thread; replaces the CPU scan+readback
+            [es endEncoding];
+            id<MTLComputeCommandEncoder> esc = [cmd computeCommandEncoder];
+            [esc setBuffer:B.cellId offset:0 atIndex:0];
+            [esc setBuffer:B.cellOffset offset:0 atIndex:1];
+            [esc setBuffer:pts offset:0 atIndex:2];
+            [esc setBuffer:B.sPoints offset:0 atIndex:3];
+            [esc setBytes:&P length:sizeof(P) atIndex:4];
+            dispatch1d(esc, ctx.psoScatterFast, (NSUInteger)N);
+            [esc endEncoding];
+        };
+
+        // density -> factor -> constant-density source clamp (B.density hazard tracked).
+        auto enc_dfac = [&](id<MTLCommandBuffer> cmd){
+            auto bind_pp = [&](id<MTLComputeCommandEncoder> enc,
+                               id<MTLComputePipelineState> pso, id<MTLBuffer> dstOut){
+                [enc setBuffer:pts offset:0 atIndex:0];
+                [enc setBuffer:B.sPoints offset:0 atIndex:1];
+                [enc setBuffer:vol offset:0 atIndex:2];
+                [enc setBuffer:B.cellStart offset:0 atIndex:3];
+                [enc setBuffer:B.bVol offset:0 atIndex:4];
+                [enc setBuffer:B.bXj offset:0 atIndex:5];
+                [enc setBuffer:dstOut offset:0 atIndex:6];
+                [enc setBytes:&Pp length:sizeof(Pp) atIndex:7];
+                dispatch1d(enc, pso, (NSUInteger)N);
+            };
+            id<MTLComputeCommandEncoder> e1 = [cmd computeCommandEncoder]; bind_pp(e1, ctx.psoDensity, B.density);   [e1 endEncoding];
+            id<MTLComputeCommandEncoder> e2 = [cmd computeCommandEncoder]; bind_pp(e2, ctx.psoFactor,  B.factorBuf); [e2 endEncoding];
+            id<MTLComputeCommandEncoder> e3 = [cmd computeCommandEncoder];
+            [e3 setBuffer:B.density offset:0 atIndex:0];
+            [e3 setBuffer:B.densAdv offset:0 atIndex:1];
+            [e3 setBytes:&Pp length:sizeof(Pp) atIndex:2];
+            dispatch1d(e3, ctx.psoDensadvClamp, (NSUInteger)N);
+            [e3 endEncoding];
+        };
+
+        // optional XSPH: sweep into velSmooth (reads pre-smoothing vel), blit back into vel.
+        auto enc_xsph = [&](id<MTLCommandBuffer> cmd){
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setBuffer:pts offset:0 atIndex:0];
+            [enc setBuffer:B.sPoints offset:0 atIndex:1];
+            [enc setBuffer:vol offset:0 atIndex:2];
+            [enc setBuffer:B.cellStart offset:0 atIndex:3];
+            [enc setBuffer:vel offset:0 atIndex:4];   // velIn
+            [enc setBuffer:B.density offset:0 atIndex:5];
+            [enc setBuffer:B.velSmooth offset:0 atIndex:6];   // velOut
+            [enc setBytes:&Pp length:sizeof(Pp) atIndex:7];
+            dispatch1d(enc, ctx.psoXsph, (NSUInteger)N);
+            [enc endEncoding];
+            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+            [blit copyFromBuffer:B.velSmooth sourceOffset:0 toBuffer:vel destinationOffset:0
+                            size:sizeof(float) * 3 * (size_t)N];
+            [blit endEncoding];
+        };
+
+        // neighbour list (exact CSR): per-particle count -> GPU exclusive-scan into nlStart.
+        // The one-word total nlStart[N] is read after this command buffer to size nlId/nlVgw;
+        // the fill (enc_nlfill) then runs in the next command buffer.
+        auto enc_nlcount = [&](id<MTLCommandBuffer> cmd){
+            id<MTLComputeCommandEncoder> ec = [cmd computeCommandEncoder];
+            [ec setBuffer:pts offset:0 atIndex:0];
+            [ec setBuffer:B.sPoints offset:0 atIndex:1];
+            [ec setBuffer:B.cellStart offset:0 atIndex:2];
+            [ec setBuffer:B.count offset:0 atIndex:3];
+            [ec setBytes:&Pp length:sizeof(Pp) atIndex:4];
+            dispatch1d(ec, ctx.psoNlCount, (NSUInteger)N);
+            [ec endEncoding];
+            id<MTLComputeCommandEncoder> es = [cmd computeCommandEncoder];   // counts -> nlStart (exclusive)
+            [es setBuffer:B.count offset:0 atIndex:0];
+            [es setBuffer:B.nlStart offset:0 atIndex:1];
+            [es setBytes:&Pp length:sizeof(Pp) atIndex:2];
+            dispatch1d(es, ctx.psoExscan, 1);
+            [es endEncoding];
+        };
+        auto enc_nlfill = [&](id<MTLCommandBuffer> cmd){
+            id<MTLComputeCommandEncoder> ef = [cmd computeCommandEncoder];
+            [ef setBuffer:pts offset:0 atIndex:0];
+            [ef setBuffer:B.sPoints offset:0 atIndex:1];
+            [ef setBuffer:vol offset:0 atIndex:2];
+            [ef setBuffer:B.cellStart offset:0 atIndex:3];
+            [ef setBuffer:B.nlStart offset:0 atIndex:4];
+            [ef setBuffer:B.bVol offset:0 atIndex:5];
+            [ef setBuffer:B.bXj offset:0 atIndex:6];
+            [ef setBuffer:B.nlId offset:0 atIndex:7];
+            [ef setBuffer:B.nlVgw offset:0 atIndex:8];
+            [ef setBuffer:B.bVgw offset:0 atIndex:9];
+            [ef setBytes:&Pp length:sizeof(Pp) atIndex:10];
+            dispatch1d(ef, ctx.psoNlFill, (NSUInteger)N);
+            [ef endEncoding];
+        };
+
+        // CSR pressure-accel / Jacobi-update encoders (read nlStart[i]..nlStart[i+1]).
+        auto enc_accel = [&](id<MTLComputeCommandEncoder> enc){
+            [enc setBuffer:B.nlStart offset:0 atIndex:0];
+            [enc setBuffer:B.nlId    offset:0 atIndex:1];
+            [enc setBuffer:B.nlVgw   offset:0 atIndex:2];
+            [enc setBuffer:B.bVgw    offset:0 atIndex:3];
+            [enc setBuffer:B.pRho2   offset:0 atIndex:4];
+            [enc setBuffer:B.accel   offset:0 atIndex:5];
+            [enc setBytes:&Ps length:sizeof(Ps) atIndex:6];
+            dispatch1d(enc, ctx.psoPaNl, (NSUInteger)N);
+        };
+        auto enc_update = [&](id<MTLComputeCommandEncoder> enc){
+            [enc setBuffer:B.nlStart   offset:0 atIndex:0];
+            [enc setBuffer:B.nlId      offset:0 atIndex:1];
+            [enc setBuffer:B.nlVgw     offset:0 atIndex:2];
+            [enc setBuffer:B.bVgw      offset:0 atIndex:3];
+            [enc setBuffer:B.accel     offset:0 atIndex:4];
+            [enc setBuffer:B.densAdv   offset:0 atIndex:5];
+            [enc setBuffer:B.factorBuf offset:0 atIndex:6];
+            [enc setBuffer:B.pRho2     offset:0 atIndex:7];
+            [enc setBuffer:B.err       offset:0 atIndex:8];
+            [enc setBytes:&Ps length:sizeof(Ps) atIndex:9];
+            dispatch1d(enc, ctx.psoPuNl, (NSUInteger)N);
+        };
+        // g Jacobi iterations (accel -> update). When zeroErr, B.err is cleared right
+        // before the final update so a post-wait read is that iteration's density error.
+        auto enc_jacobi = [&](id<MTLCommandBuffer> cmd, int g, bool zeroErr){
+            for (int k = 0; k < g; k++) {
+                id<MTLComputeCommandEncoder> ea = [cmd computeCommandEncoder]; enc_accel(ea); [ea endEncoding];
+                if (zeroErr && k == g - 1) {
+                    id<MTLBlitCommandEncoder> bz = [cmd blitCommandEncoder];
+                    [bz fillBuffer:B.err range:NSMakeRange(0, sizeof(float)) value:0];
+                    [bz endEncoding];
+                }
+                id<MTLComputeCommandEncoder> eu = [cmd computeCommandEncoder]; enc_update(eu); [eu endEncoding];
+            }
+        };
+        // final accel from the converged p~, packed straight into the caller's float3 buffer.
+        auto enc_final = [&](id<MTLCommandBuffer> cmd){
+            id<MTLComputeCommandEncoder> ea = [cmd computeCommandEncoder]; enc_accel(ea); [ea endEncoding];
+            id<MTLComputeCommandEncoder> ecp = [cmd computeCommandEncoder];
+            [ecp setBuffer:B.accel offset:0 atIndex:0];
+            [ecp setBuffer:out     offset:0 atIndex:1];
+            [ecp setBytes:&Ps length:sizeof(Ps) atIndex:2];
+            dispatch1d(ecp, ctx.psoAccelCopy3, (NSUInteger)N);
+            [ecp endEncoding];
+        };
+
+        int maxIt = req.max_iterations > 0 ? req.max_iterations : 1;
+        int minIt = req.min_iterations < 0 ? 0 : req.min_iterations;
+        if (minIt > maxIt) minIt = maxIt;
+        const bool earlyOut = (req.eta > 0.0f && minIt < maxIt);
+
+        // Size the exact CSR pair buffers from the neighbour-count scan. Shared by both
+        // paths: run CB1 (grid -> density/factor/clamp -> [XSPH] -> nl_count -> scan),
+        // wait once, then read the single word nlStart[N] (the pair total) and grow
+        // nlId/nlVgw to exactly that. CB1 has drained, so the realloc cannot race.
+        auto build_and_size_nl = [&]{
+            id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
+            enc_grid(cmd);
+            enc_dfac(cmd);
+            if (doXsph) enc_xsph(cmd);
+            enc_nlcount(cmd);
+            [cmd commit];
+            [cmd waitUntilCompleted];
+            const uint32_t tot = ((const uint32_t*)B.nlStart.contents)[N];
+            const size_t p = (size_t)(tot > 0 ? tot : 1);
+            ensure(dev, B.nlId,  sizeof(int)   * p);
+            ensure(dev, B.nlVgw, sizeof(float) * 4 * p);
+        };
+
+        if (!earlyOut) {
+            // Two command buffers, two waits: CB1 (grid..nl_count..scan) then, after the
+            // one-word size readback, CB2 = nl_fill -> all Jacobi iterations -> final pack.
+            build_and_size_nl();
+            id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
+            enc_nlfill(cmd);
+            enc_jacobi(cmd, maxIt, /*zeroErr=*/false);
+            enc_final(cmd);
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        } else {
+            // Early-out requested: the convergence readback forces splitting the Jacobi
+            // loop. CB1 builds+sizes the list; the fill rides the first chunk's buffer;
+            // then chunked Jacobi (one wait per chunk) and the final accel pack.
+            build_and_size_nl();
+            const int kSolveChunk = 4;
+            int done = 0;
+            bool filled = false;
+            while (done < maxIt) {
+                int g = (maxIt - done < kSolveChunk) ? (maxIt - done) : kSolveChunk;
+                id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
+                if (!filled) { enc_nlfill(cmd); filled = true; }
+                enc_jacobi(cmd, g, /*zeroErr=*/true);
+                [cmd commit];
+                [cmd waitUntilCompleted];
+                done += g;
+                double err = (double)(*(const float*)B.err.contents) / (double)N;
+                if (done >= minIt && err <= (double)req.eta) break;
+            }
+            {
+                id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
+                enc_final(cmd);
+                [cmd commit];
+                [cmd waitUntilCompleted];
+            }
+        }
+
+        // Leave no reusable cache behind: the resident grid/NL scratch is fluid-only and
+        // must not be picked up by a later host-pointer solve (which may add boundary).
+        g_gridValid = false;
+        g_nlValid   = false;
     }
     return true;
 }
