@@ -279,17 +279,30 @@ bool tns::TreeNSearch::run_gpu()
 	}
 
 	// ── Assemble solution_ptr from the GPU result ───────────────────────────────
-	// gpu_solution_data owns the packed [count, ids...] runs; solution_ptr points into it.
+	// Zero-copy: the packed [count, ids...] runs live in the backend's persistent
+	// unified-memory buffers; solution_ptr points straight into them. They remain
+	// valid until the next run_gpu()/metal_neighbor_search call in the process
+	// (one live search result at a time — same as the previous copy-out semantics,
+	// but process-wide instead of per-instance).
 	this->gpu_solution_data.assign(this->n_sets * this->n_sets, std::vector<int>());
 	for (MetalPairResult& pr : result.pairs) {
 		const int pair_id = this->_get_set_pair_id(pr.set_i, pr.set_j);
 		const int n = this->get_n_points_in_set(pr.set_i);
-		std::vector<int>& backing = this->gpu_solution_data[pair_id];
-		backing = std::move(pr.block);
 		std::vector<int*>& ptrs = this->solution_ptr[pair_id];
 		ptrs.resize(n);
-		for (int i = 0; i < n; i++) {
-			ptrs[i] = backing.data() + pr.block_offset[i];
+		if (pr.block_ptr != nullptr) {
+			int* base = const_cast<int*>(pr.block_ptr);
+			const int* off = pr.block_offset_ptr;
+			for (int i = 0; i < n; i++) {
+				ptrs[i] = base + off[i];
+			}
+		}
+		else {
+			std::vector<int>& backing = this->gpu_solution_data[pair_id];
+			backing = std::move(pr.block);
+			for (int i = 0; i < n; i++) {
+				ptrs[i] = backing.data() + pr.block_offset[i];
+			}
 		}
 	}
 
