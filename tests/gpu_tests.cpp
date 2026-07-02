@@ -398,6 +398,10 @@ void benchmark(int n, float radius)
 
 } // namespace
 
+// Defined in gpu_resident_check.mm: validates metal_sph_solve_gpu (GPU-resident solve
+// over caller MTLBuffers) against the host-pointer path. Returns the failure count.
+extern "C" int run_resident_checks();
+
 int main()
 {
 	std::cout << "GPU available: " << (tns::TreeNSearch::is_gpu_available() ? "yes" : "no") << std::endl;
@@ -405,6 +409,8 @@ int main()
 		std::cout << "No Metal device; GPU tests cannot run." << std::endl;
 		return 0;
 	}
+
+	g_failures += run_resident_checks();
 
 	std::cout << "\n=== Correctness vs brute force ===" << std::endl;
 	for (int n : {2000, 20000}) {
