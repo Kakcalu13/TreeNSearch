@@ -42,6 +42,7 @@ struct Params {
     float aij_scale;      // aij_pj multiplier: h^2 (pressure) or h (divergence)
     int   divergence;     // 1 -> divergence mode (s_i=-densityAdv, deficiency cutoff)
     float viscosity;      // XSPH velocity-smoothing strength (0 = off)
+    int   maxNbr;         // neighbour cap per particle (resident solve); <=0 = exact
 };
 
 static inline int cell_index(float3 p, constant Params& P)
@@ -774,6 +775,8 @@ kernel void k_scatter_sph(device const uint*   cellId     [[buffer(0)]],
 // linearisation, so the 3x3x3 block collapses into 9 contiguous slot ranges
 // (one per (y,z) row) — 9 range lookups instead of 27 cell lookups, and each
 // range is one contiguous, coalesced run of sortedPos.
+// With P.maxNbr > 0 the count stops at the cap: the traversal order here and in
+// k_sph_build is identical, so both keep exactly the first maxNbr neighbours.
 kernel void k_nl_count_sorted(device const float4* sortedPos [[buffer(0)]],
                               device const uint*   cellStart [[buffer(1)]],
                               device uint*         counts    [[buffer(2)]],
@@ -782,18 +785,19 @@ kernel void k_nl_count_sorted(device const float4* sortedPos [[buffer(0)]],
 {
     if ((int)i >= P.nSearch) return;
     const float h2 = P.r2 * P.r2;
+    const int cap = (P.maxNbr > 0) ? P.maxNbr : 0x7FFFFFFF;
     float3 xi = sortedPos[i].xyz;
     int cx = clamp((int)floor((xi.x - P.ox) * P.inv_cs), 0, P.dx - 1);
     int cy = clamp((int)floor((xi.y - P.oy) * P.inv_cs), 0, P.dy - 1);
     int cz = clamp((int)floor((xi.z - P.oz) * P.inv_cs), 0, P.dz - 1);
     int xlo = max(cx - 1, 0), xhi = min(cx + 1, P.dx - 1);
     int n = 0;
-    for (int dz = -1; dz <= 1; dz++) { int ncz = cz + dz; if (ncz < 0 || ncz >= P.dz) continue;
-    for (int dy = -1; dy <= 1; dy++) { int ncy = cy + dy; if (ncy < 0 || ncy >= P.dy) continue;
+    for (int dz = -1; dz <= 1 && n < cap; dz++) { int ncz = cz + dz; if (ncz < 0 || ncz >= P.dz) continue;
+    for (int dy = -1; dy <= 1 && n < cap; dy++) { int ncy = cy + dy; if (ncy < 0 || ncy >= P.dy) continue;
         int row = (ncz * P.dy + ncy) * P.dx;
         uint begin = cellStart[row + xlo];
         uint end   = cellStart[row + xhi + 1];
-        for (uint s = begin; s < end; s++) {
+        for (uint s = begin; s < end && n < cap; s++) {
             if (s == i) continue;
             float3 e = xi - sortedPos[s].xyz;
             if (dot(e, e) <= h2) n++;
@@ -807,6 +811,10 @@ kernel void k_nl_count_sorted(device const float4* sortedPos [[buffer(0)]],
 // source. Replaces four separate traversals (density, factor, nl-count, nl-fill)
 // of the previous design; only the count pass above remains separate (the CSR
 // layout needs the totals first).
+// The traversal stops when the CSR row is full (k == nlStart[i+1]). Uncapped
+// that changes nothing (the row is exactly the neighbour count); with a capped
+// count it truncates density/factor/source along with the list, so the solve
+// stays self-consistent on the truncated neighbourhood.
 kernel void k_sph_build(device const float4* sortedPos  [[buffer(0)]],
                         device const float*  sortedVol  [[buffer(1)]],
                         device const uint*   cellStart  [[buffer(2)]],
@@ -835,12 +843,13 @@ kernel void k_sph_build(device const float4* sortedPos  [[buffer(0)]],
     int cz = clamp((int)floor((xi.z - P.oz) * P.inv_cs), 0, P.dz - 1);
     int xlo = max(cx - 1, 0), xhi = min(cx + 1, P.dx - 1);
     uint k = nlStart[i];
-    for (int dz = -1; dz <= 1; dz++) { int ncz = cz + dz; if (ncz < 0 || ncz >= P.dz) continue;
-    for (int dy = -1; dy <= 1; dy++) { int ncy = cy + dy; if (ncy < 0 || ncy >= P.dy) continue;
+    const uint kend = nlStart[i + 1];
+    for (int dz = -1; dz <= 1 && k < kend; dz++) { int ncz = cz + dz; if (ncz < 0 || ncz >= P.dz) continue;
+    for (int dy = -1; dy <= 1 && k < kend; dy++) { int ncy = cy + dy; if (ncy < 0 || ncy >= P.dy) continue;
         int row = (ncz * P.dy + ncy) * P.dx;
         uint begin = cellStart[row + xlo];
         uint end   = cellStart[row + xhi + 1];
-        for (uint s = begin; s < end; s++) {
+        for (uint s = begin; s < end && k < kend; s++) {
             if (s == i) continue;
             float3 rvec = xi - sortedPos[s].xyz;
             float d2 = dot(rvec, rvec);
@@ -1156,6 +1165,7 @@ struct ParamsC {
     float aij_scale;
     int   divergence;
     float viscosity;   // mirrors Params (MSL); XSPH strength, 0 = off
+    int   maxNbr;      // mirrors Params (MSL); neighbour cap, <=0 = exact
 };
 
 static void dispatch1d(id<MTLComputeCommandEncoder> enc,
@@ -1905,6 +1915,7 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         P.inv_cs = 1.0f / req.h;
         P.dx = req.grid_dims[0]; P.dy = req.grid_dims[1]; P.dz = req.grid_dims[2];
         P.R = 1; P.nCells = nCells; P.totalPoints = N; P.nSearch = N; P.r2 = req.h;
+        P.maxNbr = req.max_neighbors;   // <=0 = exact CSR; >0 caps rows (see header)
 
         // ── Scratch. Everything internal lives in SORTED (cell) order: the scatter
         //    reorders position + volume + original id, the fused build emits the CSR
@@ -1912,8 +1923,9 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         //    Jacobi state (pRho2 / accel / densAdv / factor) is indexed by sorted slot
         //    so neighbour gathers stay cache-local. Both prefix-sums are parallel GPU
         //    scans. The only host dependency is the one-word pair total nlStart[N],
-        //    read back to size nlId/nlVgw (exact CSR, no cap) — hence two command
-        //    buffers / two waits. Results are scattered to caller order at the end. ──
+        //    read back to size nlId/nlVgw (exact CSR by default; req.max_neighbors
+        //    caps rows at the count) — hence two command buffers / two waits.
+        //    Results are scattered to caller order at the end. ──
         ensure(dev, B.cellId,     sizeof(uint32_t) * (size_t)N);
         ensure(dev, B.counts,     sizeof(uint32_t) * (size_t)nCells);
         ensure(dev, B.cellStart,  sizeof(uint32_t) * (size_t)(nCells + 1));
