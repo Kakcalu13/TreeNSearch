@@ -35,7 +35,10 @@ double now_ms()
 
 // SPH-like block: n particles on a jittered cubic lattice with unit spacing,
 // support radius h = 2 (lattice units) -> ~33 neighbours per interior particle.
-void make_block(int n, std::vector<float>& pts3, float& h, float& particleVolume)
+// compress < 1 shrinks the lattice while h stays fixed (neighbour count scales
+// as 1/compress^3) — the transient over-compression regime of a slosh pocket.
+void make_block(int n, std::vector<float>& pts3, float& h, float& particleVolume,
+                float compress = 1.0f)
 {
     const int side = (int)std::ceil(std::cbrt((double)n));
     std::mt19937 rng(7);
@@ -45,9 +48,9 @@ void make_block(int n, std::vector<float>& pts3, float& h, float& particleVolume
     for (int z = 0; z < side && p < n; z++)
         for (int y = 0; y < side && p < n; y++)
             for (int x = 0; x < side && p < n; x++, p++) {
-                pts3[3 * (size_t)p + 0] = (float)x + jit(rng);
-                pts3[3 * (size_t)p + 1] = (float)y + jit(rng);
-                pts3[3 * (size_t)p + 2] = (float)z + jit(rng);
+                pts3[3 * (size_t)p + 0] = ((float)x + jit(rng)) * compress;
+                pts3[3 * (size_t)p + 1] = ((float)y + jit(rng)) * compress;
+                pts3[3 * (size_t)p + 2] = ((float)z + jit(rng)) * compress;
             }
     h = 2.0f;              // support radius = 2 * spacing (typical SPH)
     particleVolume = 1.0f; // spacing^3 -> rest-normalised density ~ 1
@@ -55,11 +58,12 @@ void make_block(int n, std::vector<float>& pts3, float& h, float& particleVolume
 
 struct BenchResult { double median_ms = 0, best_ms = 0; };
 
-BenchResult bench_solve(id<MTLDevice> dev, int n, int iters, int reps)
+BenchResult bench_solve(id<MTLDevice> dev, int n, int iters, int reps,
+                        float compress = 1.0f, int cap = 0)
 {
     using namespace tns::internals;
     std::vector<float> pts3; float h = 0, vol0 = 0;
-    make_block(n, pts3, h, vol0);
+    make_block(n, pts3, h, vol0, compress);
 
     float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
     for (int i = 0; i < n; i++)
@@ -81,6 +85,7 @@ BenchResult bench_solve(id<MTLDevice> dev, int n, int iters, int reps)
         req.grid_dims[d] = (int)std::floor((mx[d] - mn[d]) / h) + 1;
     }
     req.min_iterations = iters; req.max_iterations = iters; req.eta = 0.0f;   // fixed-count
+    req.max_neighbors = cap;   // 0 = exact CSR
 
     std::string err;
     if (!metal_sph_solve_gpu(req, err)) {   // warm-up (also sizes the buffer cache)
@@ -118,6 +123,18 @@ int main()
             for (int iters : {2, 6, 12}) {
                 auto r = bench_solve(dev, n, iters, 15);
                 std::printf("%10d %6d %12.3f %12.3f\n", n, iters, r.median_ms, r.best_ms);
+            }
+        }
+
+        // The slosh-pocket regime: lattice compressed to 0.7 spacing (~3x the
+        // neighbour density, ~100/particle) — where the Jacobi cost blows up and
+        // the neighbour cap (max_neighbors) is meant to flatten it.
+        std::printf("\ncompressed block (x0.7 spacing, ~100 nbrs/particle), cap 0 vs 60\n");
+        std::printf("%10s %6s %6s %12s %12s\n", "N", "iters", "cap", "median(ms)", "best(ms)");
+        for (int n : {3000, 20000, 131072}) {
+            for (int cap : {0, 60}) {
+                auto r = bench_solve(dev, n, 14, 15, 0.7f, cap);
+                std::printf("%10d %6d %6d %12.3f %12.3f\n", n, 14, cap, r.median_ms, r.best_ms);
             }
         }
     }
