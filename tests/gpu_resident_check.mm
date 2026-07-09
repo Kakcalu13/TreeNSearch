@@ -36,7 +36,9 @@ std::vector<float> rand_vec(int count, float lo, float hi, unsigned seed)
 }
 
 // One resident-vs-host comparison at n particles. Returns the failure count (0 = pass).
-int check_resident(id<MTLDevice> dev, id<MTLCommandQueue> queue, int n)
+// cap > 0 sets req.max_neighbors; passing a cap no neighbourhood reaches must
+// reproduce the exact solve (the host reference is always uncapped).
+int check_resident(id<MTLDevice> dev, id<MTLCommandQueue> queue, int n, int cap = 0)
 {
     using namespace tns::internals;
     const float h = 0.6f, dt = 0.0025f, density0 = 1000.0f;
@@ -76,6 +78,7 @@ int check_resident(id<MTLDevice> dev, id<MTLCommandQueue> queue, int n)
     req.n = n; req.h = h; req.dt = dt; req.density0 = density0;
     for (int d = 0; d < 3; d++) { req.origin[d] = origin[d]; req.grid_dims[d] = dims[d]; }
     req.min_iterations = ITERS; req.max_iterations = ITERS; req.eta = 0.0f;   // fixed-count solve
+    req.max_neighbors = cap;
     if (!metal_sph_solve_gpu(req, err)) {
         std::printf("  n=%d: resident solve FAILED: %s\n", n, err.c_str());
         return 1;
@@ -112,12 +115,78 @@ int check_resident(id<MTLDevice> dev, id<MTLCommandQueue> queue, int n)
         refMag = std::max(refMag, std::abs(r));
     }
     const bool pass = (maxRel < 1e-3) || (maxAbs < 1e-4 * (refMag + 1e-9));
-    std::printf("  n=%d: accel max abs err %.3e, max rel err %.3e (|accel|max %.3e) ... %s\n",
-                n, maxAbs, maxRel, refMag, pass ? "passed!" : "FAILED!");
+    std::printf("  n=%d%s: accel max abs err %.3e, max rel err %.3e (|accel|max %.3e) ... %s\n",
+                n, cap > 0 ? " (non-binding cap)" : "",
+                maxAbs, maxRel, refMag, pass ? "passed!" : "FAILED!");
 
     // The host reference path above leaves the cached neighbour list valid (g_nlValid).
     // Clear it so a later independent solve (e.g. gpu_tests' density_check, which relies
     // on the cache starting empty) rebuilds its own list instead of reusing ours.
+    metal_sph_invalidate_grid();
+    return pass ? 0 : 1;
+}
+
+// Binding-cap sanity: an over-compressed random cloud (hundreds of neighbours
+// per particle) solved with a hard cap. The truncated neighbour set depends on
+// GPU counting-sort slot order, so there is no CPU reference to compare against;
+// the guard is that the capped solve succeeds and every output stays finite
+// (the failure mode of a broken cap is CSR row overflow -> garbage/NaN).
+int check_capped(id<MTLDevice> dev, id<MTLCommandQueue> queue, int n, int cap)
+{
+    using namespace tns::internals;
+    const float h = 0.6f, dt = 0.0025f, density0 = 1000.0f;
+    std::string err;
+
+    // Same recipe as check_resident but in a [0,2]^3 box: ~125x the pair
+    // density of the [0,10]^3 cloud (several hundred neighbours/particle).
+    std::vector<float> pts3 = rand_vec(3 * n, 0.0f, 2.0f, 301);
+    std::vector<float> vol  = rand_vec(n, 0.8f, 1.2f, 302);
+    for (auto& x : vol) x *= 0.02f;
+
+    float mn[3] = { 1e30f,  1e30f,  1e30f};
+    float mx[3] = {-1e30f, -1e30f, -1e30f};
+    for (int i = 0; i < n; i++)
+        for (int d = 0; d < 3; d++) { float v = pts3[3*i+d]; mn[d] = std::min(mn[d], v); mx[d] = std::max(mx[d], v); }
+    float origin[3]; int dims[3];
+    for (int d = 0; d < 3; d++) { origin[d] = mn[d]; dims[d] = (int)std::floor((mx[d] - mn[d]) / h) + 1; }
+
+    metal_sph_set_external_context((__bridge void*)dev, (__bridge void*)queue);
+    id<MTLBuffer> pBuf = [dev newBufferWithLength:sizeof(float) * 4 * n options:MTLResourceStorageModeShared];
+    id<MTLBuffer> vBuf = [dev newBufferWithLength:sizeof(float) * n     options:MTLResourceStorageModeShared];
+    id<MTLBuffer> aBuf = [dev newBufferWithLength:sizeof(float) * 3 * n options:MTLResourceStorageModeShared];
+    float* p4 = (float*)pBuf.contents;
+    for (int i = 0; i < n; i++) {
+        p4[4*i+0] = pts3[3*i+0]; p4[4*i+1] = pts3[3*i+1]; p4[4*i+2] = pts3[3*i+2]; p4[4*i+3] = 1.0f;
+    }
+    std::memcpy(vBuf.contents, vol.data(), sizeof(float) * n);
+    std::memset(aBuf.contents, 0, sizeof(float) * 3 * n);
+
+    MetalSphGpuRequest req;
+    req.points   = (__bridge void*)pBuf;
+    req.volume   = (__bridge void*)vBuf;
+    req.outAccel = (__bridge void*)aBuf;
+    req.n = n; req.h = h; req.dt = dt; req.density0 = density0;
+    for (int d = 0; d < 3; d++) { req.origin[d] = origin[d]; req.grid_dims[d] = dims[d]; }
+    // The engine's production config: chunked early-out (min < max, eta > 0)
+    // plus the binding cap — this is the only check that drives the early-out
+    // branch of metal_sph_solve_gpu.
+    req.min_iterations = 4; req.max_iterations = 14; req.eta = 1.0e-3f * density0;
+    req.max_neighbors = cap;
+    if (!metal_sph_solve_gpu(req, err)) {
+        std::printf("  capped n=%d cap=%d: solve FAILED: %s\n", n, cap, err.c_str());
+        metal_sph_invalidate_grid();
+        return 1;
+    }
+    const float* a = (const float*)aBuf.contents;
+    int bad = 0;
+    double maxMag = 0.0;
+    for (int i = 0; i < 3 * n; i++) {
+        if (!std::isfinite(a[i])) bad++;
+        else maxMag = std::max(maxMag, (double)std::abs(a[i]));
+    }
+    const bool pass = (bad == 0);
+    std::printf("  capped n=%d cap=%d (over-compressed): %d non-finite accels, |accel|max %.3e ... %s\n",
+                n, cap, bad, maxMag, pass ? "passed!" : "FAILED!");
     metal_sph_invalidate_grid();
     return pass ? 0 : 1;
 }
@@ -225,6 +294,8 @@ int run_resident_checks()
         int fails = 0;
         fails += check_resident(dev, queue, 3000);
         fails += check_resident(dev, queue, 20000);
+        fails += check_resident(dev, queue, 3000, /*cap=*/1 << 20);   // non-binding cap == exact
+        fails += check_capped(dev, queue, 3000, /*cap=*/60);          // binding cap stays finite
         fails += check_xsph(dev, queue, 3000);
         return fails;
     }
