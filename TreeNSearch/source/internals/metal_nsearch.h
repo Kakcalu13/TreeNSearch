@@ -203,6 +203,14 @@ namespace internals
 		float eta = 0.0f;           // avg density-error threshold; <=0 => run max_iterations
 		float viscosity = 0.0f;     // XSPH velocity-smoothing strength (~0.1-0.3); 0 => off.
 		                            // When >0 and velocity!=null, the solve smooths velocity in place.
+		int   max_neighbors = 0;    // cap on neighbours per particle; <=0 => exact CSR (no cap).
+		                            // Capping flattens the neighbour-density cost scaling of the
+		                            // Jacobi solve when the fluid transiently over-compresses (the
+		                            // truncated pocket under-estimates density slightly, which the
+		                            // pressure solve corrects toward anyway). The whole solve —
+		                            // density, factor, Jacobi, XSPH — runs consistently on the
+		                            // truncated list. ~2x the rest-packing count (e.g. 60 for
+		                            // h = 2*spacing, ~33 at rest) is a good cap.
 	};
 	// Builds the grid, computes density + DFSPH factor, derives the constant-density
 	// source (relative density clamped >= 1, matching the host caller), runs the
