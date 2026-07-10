@@ -7,13 +7,16 @@
 // All Objective-C / Metal code lives in metal_nsearch.mm so that the rest of the
 // codebase never needs an Objective-C++ compiler.
 //
-// Algorithm: classic GPU uniform-grid neighbour search.
-//   1. hash every point into a background grid cell                (GPU)
-//   2. counting-sort point indices by cell                         (GPU + 1 CPU scan)
-//   3. for each searching point, sweep the (2R+1)^3 surrounding
-//      cells and test the squared-distance / radius predicate      (GPU)
-//   The search runs in two passes (count, then write) so the output
-//   neighbour lists can be tightly packed without GPU-side allocation.
+// Algorithm: classic GPU uniform-grid neighbour search, fully GPU-side.
+//   1. hash every point into a background grid cell                     (GPU)
+//   2. counting-sort by cell: parallel exclusive prefix-sum + scatter   (GPU)
+//   3. for each point, sweep the (2R+1)^3 surrounding cells — merged
+//      into (2R+1)^2 contiguous slot ranges — and test the squared-
+//      distance / radius predicate                                      (GPU)
+//   The fast path sweeps in SORTED order (adjacent threads sweep adjacent
+//   cells) storing ids to scratch rows, then compacts them into the tightly
+//   packed per-point runs; results are returned ZERO-COPY as pointers into
+//   unified-memory buffers (see MetalPairResult).
 // ─────────────────────────────────────────────────────────────────────────────
 #include <vector>
 #include <string>
@@ -58,13 +61,21 @@ namespace internals
 	};
 
 	// Result for one pair, laid out exactly as TreeNSearch::solution_ptr expects:
-	// block holds, for every point i of set_i, the contiguous run [count, id0, id1, ...]
-	// starting at block_offset[i]. Neighbour ids are set_j-local indices.
+	// for every point i of set_i, the contiguous run [count, id0, id1, ...] starts at
+	// block_offset_ptr[i]. Neighbour ids are set_j-local indices.
+	//
+	// The results are ZERO-COPY: both pointers alias persistent unified-memory
+	// (MTLBuffer) storage owned by the backend, valid until the NEXT
+	// metal_neighbor_search call in the process (the buffers are reused). Callers
+	// that need the lists beyond that must copy them out. The vectors are kept for
+	// callers that build results on the host (both never used at once).
 	struct MetalPairResult {
 		int set_i = -1;
 		int set_j = -1;
-		std::vector<int> block;          // packed [count, ids...] for every searching point
-		std::vector<int> block_offset;   // size n_points(set_i) + 1; block_offset[i] = start of point i's run
+		const int* block_ptr = nullptr;         // packed [count, ids...] runs (GPU unified memory)
+		const int* block_offset_ptr = nullptr;  // n_points(set_i) + 1 offsets into block_ptr
+		std::vector<int> block;                 // host-owned alternative (unused by the GPU path)
+		std::vector<int> block_offset;
 	};
 
 	struct MetalSearchResult {
@@ -192,6 +203,14 @@ namespace internals
 		float eta = 0.0f;           // avg density-error threshold; <=0 => run max_iterations
 		float viscosity = 0.0f;     // XSPH velocity-smoothing strength (~0.1-0.3); 0 => off.
 		                            // When >0 and velocity!=null, the solve smooths velocity in place.
+		int   max_neighbors = 0;    // cap on neighbours per particle; <=0 => exact CSR (no cap).
+		                            // Capping flattens the neighbour-density cost scaling of the
+		                            // Jacobi solve when the fluid transiently over-compresses (the
+		                            // truncated pocket under-estimates density slightly, which the
+		                            // pressure solve corrects toward anyway). The whole solve —
+		                            // density, factor, Jacobi, XSPH — runs consistently on the
+		                            // truncated list. ~2x the rest-packing count (e.g. 60 for
+		                            // h = 2*spacing, ~33 at rest) is a good cap.
 	};
 	// Builds the grid, computes density + DFSPH factor, derives the constant-density
 	// source (relative density clamped >= 1, matching the host caller), runs the

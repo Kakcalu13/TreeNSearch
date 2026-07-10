@@ -29,4 +29,10 @@ if (APPLE)
 	target_include_directories(gpu_tests PRIVATE ${CMAKE_SOURCE_DIR}/TreeNSearch/source)
 	# ARC for the Objective-C++ resident-solve test (uses __bridge casts).
 	set_source_files_properties(gpu_resident_check.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+
+	# Timing harness for the GPU-resident solve (wall time only, no correctness checks).
+	add_executable(gpu_bench gpu_bench.mm)
+	target_link_libraries(gpu_bench PUBLIC TreeNSearch)
+	target_include_directories(gpu_bench PRIVATE ${CMAKE_SOURCE_DIR}/TreeNSearch/source)
+	set_source_files_properties(gpu_bench.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()

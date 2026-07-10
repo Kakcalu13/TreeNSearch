@@ -42,6 +42,7 @@ struct Params {
     float aij_scale;      // aij_pj multiplier: h^2 (pressure) or h (divergence)
     int   divergence;     // 1 -> divergence mode (s_i=-densityAdv, deficiency cutoff)
     float viscosity;      // XSPH velocity-smoothing strength (0 = off)
+    int   maxNbr;         // neighbour cap per particle (resident solve); <=0 = exact
 };
 
 static inline int cell_index(float3 p, constant Params& P)
@@ -207,118 +208,11 @@ kernel void k_scatter_fast(device const uint*    cellId      [[buffer(0)]],
     sortedPos[slot] = p;
 }
 
-static inline int sweep_fast(uint i,
-                             device const float4* points,
-                             device const float4* sortedPos,
-                             device const uint*   cellStart,
-                             constant Params&     P,
-                             device int*          out)
-{
-    int gid_i = P.setOffsetI + (int)i;     // setOffsetI == 0 for the single-set case
-    float3 pi = points[gid_i].xyz;
-
-    int cx = clamp((int)floor((pi.x - P.ox) * P.inv_cs), 0, P.dx - 1);
-    int cy = clamp((int)floor((pi.y - P.oy) * P.inv_cs), 0, P.dy - 1);
-    int cz = clamp((int)floor((pi.z - P.oz) * P.inv_cs), 0, P.dz - 1);
-
-    int count = 0;
-    for (int dz = -P.R; dz <= P.R; dz++) {
-        int ncz = cz + dz; if (ncz < 0 || ncz >= P.dz) continue;
-        for (int dy = -P.R; dy <= P.R; dy++) {
-            int ncy = cy + dy; if (ncy < 0 || ncy >= P.dy) continue;
-            for (int dx = -P.R; dx <= P.R; dx++) {
-                int ncx = cx + dx; if (ncx < 0 || ncx >= P.dx) continue;
-                int lin = (ncz * P.dy + ncy) * P.dx + ncx;
-                uint begin = cellStart[lin];
-                uint end   = cellStart[lin + 1];
-                for (uint s = begin; s < end; s++) {
-                    float4 q = sortedPos[s];
-                    int gid_j = as_type<int>(q.w);
-                    if (gid_j == gid_i) continue;
-                    float3 e = pi - q.xyz;
-                    float d2 = dot(e, e);
-                    if (d2 <= P.r2) {
-                        if (out != nullptr) out[count] = gid_j - P.setOffsetJ;
-                        count++;
-                    }
-                }
-            }
-        }
-    }
-    return count;
-}
-
-// Single-sweep search: do the distance tests ONCE, storing neighbour ids into a
-// per-point scratch row (capacity TNS_MAXNB) and recording the true (uncapped)
-// count. A later compaction packs the rows — avoiding the expensive second sweep.
+// Single-sweep search (k_search_fast_sorted, further below): distance tests run
+// ONCE, neighbour ids go to a per-point scratch row (capacity TNS_MAXNB) with the
+// true (uncapped) count recorded; a later compaction packs the rows — avoiding an
+// expensive second sweep. Overflowing rows (rare) are re-swept into place.
 #define TNS_MAXNB 128
-
-kernel void k_search_fast(device const float4* points    [[buffer(0)]],
-                          device const float4* sortedPos [[buffer(1)]],
-                          device const uint*   cellStart [[buffer(2)]],
-                          device int*          scratch   [[buffer(3)]],
-                          device uint*         outCount  [[buffer(4)]],
-                          constant Params&     P         [[buffer(5)]],
-                          uint                 i         [[thread_position_in_grid]])
-{
-    if ((int)i >= P.nSearch) return;
-    int gid_i = P.setOffsetI + (int)i;
-    float3 pi = points[gid_i].xyz;
-
-    int cx = clamp((int)floor((pi.x - P.ox) * P.inv_cs), 0, P.dx - 1);
-    int cy = clamp((int)floor((pi.y - P.oy) * P.inv_cs), 0, P.dy - 1);
-    int cz = clamp((int)floor((pi.z - P.oz) * P.inv_cs), 0, P.dz - 1);
-
-    device int* sc = scratch + (uint)i * TNS_MAXNB;
-    int count = 0;
-    for (int dz = -P.R; dz <= P.R; dz++) {
-        int ncz = cz + dz; if (ncz < 0 || ncz >= P.dz) continue;
-        for (int dy = -P.R; dy <= P.R; dy++) {
-            int ncy = cy + dy; if (ncy < 0 || ncy >= P.dy) continue;
-            for (int dx = -P.R; dx <= P.R; dx++) {
-                int ncx = cx + dx; if (ncx < 0 || ncx >= P.dx) continue;
-                int lin = (ncz * P.dy + ncy) * P.dx + ncx;
-                uint begin = cellStart[lin];
-                uint end   = cellStart[lin + 1];
-                for (uint s = begin; s < end; s++) {
-                    float4 q = sortedPos[s];
-                    int gid_j = as_type<int>(q.w);
-                    if (gid_j == gid_i) continue;
-                    float3 e = pi - q.xyz;
-                    if (dot(e, e) <= P.r2) {
-                        if (count < TNS_MAXNB) sc[count] = gid_j - P.setOffsetJ;
-                        count++;
-                    }
-                }
-            }
-        }
-    }
-    outCount[i] = (uint)count;
-}
-
-// Pack scratch rows into the tight [count, ids...] output. The rare point whose
-// neighbour count exceeded the scratch capacity is re-swept directly into place.
-kernel void k_compact_fast(device const float4* points      [[buffer(0)]],
-                           device const float4* sortedPos   [[buffer(1)]],
-                           device const uint*   cellStart   [[buffer(2)]],
-                           device const int*    scratch     [[buffer(3)]],
-                           device const uint*   outCount    [[buffer(4)]],
-                           device const int*    blockOffset [[buffer(5)]],
-                           device int*          block       [[buffer(6)]],
-                           constant Params&     P           [[buffer(7)]],
-                           uint                 i           [[thread_position_in_grid]])
-{
-    if ((int)i >= P.nSearch) return;
-    int base = blockOffset[i];
-    int cnt  = (int)outCount[i];
-    block[base] = cnt;
-    if (cnt <= TNS_MAXNB) {
-        device const int* sc = scratch + (uint)i * TNS_MAXNB;
-        for (int k = 0; k < cnt; k++) block[base + 1 + k] = sc[k];
-    } else {
-        sweep_fast(i, points, sortedPos, cellStart, P, block + base + 1);  // overflow: re-sweep
-    }
-}
 
 // ─── SPH density (CubicKernel) ────────────────────────────────────────────────
 // P.r2 holds h (support radius) here; P.inv_cs = 1/cell_size = 1/h; cells swept R=1.
@@ -762,125 +656,365 @@ kernel void k_pu_nl(device const uint*   nlStart [[buffer(0)]],
     atomic_fetch_add_explicit(errSum, -P.density0 * residuum, memory_order_relaxed);
 }
 
-// ─── GPU-resident constant-density source term ───────────────────────────────
-// densAdv_i = relative density clamped to >= 1 (only compression is corrected);
-// non-finite density -> 1 (rest). Mirrors the host caller's CPU clamp so the
-// resident solve is numerically identical. density holds rho_i/rho0 here.
-kernel void k_densadv_clamp(device const float* density [[buffer(0)]],
-                            device float*       densAdv [[buffer(1)]],
-                            constant Params&    P       [[buffer(2)]],
-                            uint                i       [[thread_position_in_grid]])
+// ─── Parallel exclusive prefix-sum (three dispatches, one command buffer) ─────
+// Replaces the single-thread scans for anything that grows with N: k_scan_partial
+// scans each 256-element block in-threadgroup (simdgroup scans + a block combine)
+// and emits per-block totals; k_scan_blocks turns the block totals into exclusive
+// block offsets with one looping threadgroup; k_scan_fixup adds the block offset
+// back, writes the grand total into out[n], and (for the grid) seeds the scatter
+// cursor with the same offsets.
+struct ScanArgs {
+    uint n;          // number of input elements
+    uint numBlocks;  // ceil(n / 256)
+    uint seedCopy;   // 1 -> also write the offsets into out2 (grid scatter cursor)
+    uint addPer;     // added to every element (1 -> scan of count+1: packed [count, ids...] offsets)
+};
+
+kernel void k_scan_partial(device const uint* in       [[buffer(0)]],
+                           device uint*       partial  [[buffer(1)]],
+                           device uint*       blockSum [[buffer(2)]],
+                           constant ScanArgs& A        [[buffer(3)]],
+                           uint gid  [[thread_position_in_grid]],
+                           uint lid  [[thread_index_in_threadgroup]],
+                           uint tg   [[threadgroup_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint sg   [[simdgroup_index_in_threadgroup]])
 {
-    if ((int)i >= P.nSearch) return;
-    float d = density[i];
-    densAdv[i] = (isfinite(d) && d > 1.0f) ? d : 1.0f;
+    threadgroup uint simdSums[8];   // 256 threads / 32 lanes
+    uint v = (gid < A.n) ? (in[gid] + A.addPer) : 0u;
+    uint p = simd_prefix_exclusive_sum(v);
+    if (lane == 31) simdSums[sg] = p + v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        uint s  = (lane < 8) ? simdSums[lane] : 0u;
+        uint sp = simd_prefix_exclusive_sum(s);
+        if (lane < 8) simdSums[lane] = sp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    p += simdSums[sg];
+    if (gid < A.n) partial[gid] = p;
+    if (lid == 255) blockSum[tg] = p + v;   // block total (padding lanes carry v = 0)
 }
 
-// ─── Pack the float4 pressure accel into the caller's tight float3 buffer ─────
-kernel void k_accel_copy3(device const float4* accel [[buffer(0)]],
-                          device float*        out3  [[buffer(1)]],
-                          constant Params&     P     [[buffer(2)]],
-                          uint                 i     [[thread_position_in_grid]])
+kernel void k_scan_blocks(device uint*       blockSum [[buffer(0)]],
+                          constant ScanArgs& A        [[buffer(1)]],
+                          uint lid  [[thread_position_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint sg   [[simdgroup_index_in_threadgroup]])
 {
-    if ((int)i >= P.nSearch) return;
-    float3 a = accel[i].xyz;
-    out3[3*i+0] = a.x; out3[3*i+1] = a.y; out3[3*i+2] = a.z;
-}
-
-// ─── XSPH velocity smoothing (viscosity) ─────────────────────────────────────
-// Same grid sweep as k_density, but accumulates Sum_j V_j (v_j - v_i) W and writes
-// v_i' = v_i + viscosity * Sum / rho_i. Reads velIn, writes a SEPARATE velOut so the
-// sweep always sees pre-smoothing velocities. P.r2 = h, density precomputed in `density`.
-kernel void k_xsph(device const float4* points    [[buffer(0)]],
-                   device const float4* sortedPos [[buffer(1)]],
-                   device const float*  volume    [[buffer(2)]],
-                   device const uint*   cellStart [[buffer(3)]],
-                   device const float*  velIn     [[buffer(4)]],  // 3/particle
-                   device const float*  density   [[buffer(5)]],
-                   device float*        velOut    [[buffer(6)]],  // 3/particle
-                   constant Params&     P         [[buffer(7)]],
-                   uint                 i         [[thread_position_in_grid]])
-{
-    if ((int)i >= P.nSearch) return;
-    const float h = P.r2;
-    const float k = 8.0f / (3.14159265358979f * h * h * h);  // CubicKernel m_k
-
-    float3 pi = points[i].xyz;
-    float3 vi = float3(velIn[3*i+0], velIn[3*i+1], velIn[3*i+2]);
-    float3 acc = float3(0.0f);
-
-    int cx = clamp((int)floor((pi.x - P.ox) * P.inv_cs), 0, P.dx - 1);
-    int cy = clamp((int)floor((pi.y - P.oy) * P.inv_cs), 0, P.dy - 1);
-    int cz = clamp((int)floor((pi.z - P.oz) * P.inv_cs), 0, P.dz - 1);
-
-    for (int dz = -1; dz <= 1; dz++) {
-        int ncz = cz + dz; if (ncz < 0 || ncz >= P.dz) continue;
-        for (int dy = -1; dy <= 1; dy++) {
-            int ncy = cy + dy; if (ncy < 0 || ncy >= P.dy) continue;
-            for (int dx = -1; dx <= 1; dx++) {
-                int ncx = cx + dx; if (ncx < 0 || ncx >= P.dx) continue;
-                int lin = (ncz * P.dy + ncy) * P.dx + ncx;
-                uint begin = cellStart[lin];
-                uint end   = cellStart[lin + 1];
-                for (uint s = begin; s < end; s++) {
-                    float4 q = sortedPos[s];
-                    int gid_j = as_type<int>(q.w);
-                    if (gid_j == (int)i) continue;
-                    float r = length(pi - q.xyz);
-                    float qd = r / h;
-                    float w = 0.0f;
-                    if (qd <= 1.0f) {
-                        if (qd <= 0.5f) { float q2 = qd*qd; w = k * (6.0f*q2*qd - 6.0f*q2 + 1.0f); }
-                        else            { float f = 1.0f - qd; w = k * (2.0f*f*f*f); }
-                    }
-                    float3 vj = float3(velIn[3*gid_j+0], velIn[3*gid_j+1], velIn[3*gid_j+2]);
-                    acc += volume[gid_j] * (vj - vi) * w;
-                }
-            }
+    // One 256-wide threadgroup scans all block totals, 256 at a time.
+    threadgroup uint simdSums[8];
+    threadgroup uint carry, carryNext;
+    if (lid == 0) carry = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint base = 0; base < A.numBlocks; base += 256) {
+        uint i = base + lid;
+        uint v = (i < A.numBlocks) ? blockSum[i] : 0u;
+        uint p = simd_prefix_exclusive_sum(v);
+        if (lane == 31) simdSums[sg] = p + v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            uint s  = (lane < 8) ? simdSums[lane] : 0u;
+            uint sp = simd_prefix_exclusive_sum(s);
+            if (lane < 8) simdSums[lane] = sp;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        p += simdSums[sg] + carry;
+        if (i < A.numBlocks) blockSum[i] = p;
+        if (lid == 255) carryNext = p + v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0) carry = carryNext;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void k_scan_fixup(device const uint* partial  [[buffer(0)]],
+                         device const uint* blockSum [[buffer(1)]],   // exclusive block offsets
+                         device uint*       out      [[buffer(2)]],
+                         device uint*       out2     [[buffer(3)]],   // seeded copy (bind out when unused)
+                         device const uint* in       [[buffer(4)]],
+                         constant ScanArgs& A        [[buffer(5)]],
+                         uint gid [[thread_position_in_grid]])
+{
+    if (gid >= A.n) return;
+    uint val = partial[gid] + blockSum[gid / 256];
+    out[gid] = val;
+    if (A.seedCopy != 0) out2[gid] = val;
+    if (gid == A.n - 1) out[A.n] = val + in[gid] + A.addPer;   // grand total
+}
+
+// ─── SPH resident path, sorted-space kernels ─────────────────────────────────
+// Everything below runs over particles in CELL (sorted) order: thread i handles
+// sorted slot i, so adjacent threads sweep adjacent cells and the CSR arrays are
+// written/read contiguously. Original ids live in sortedOrig; results are
+// scattered back to caller order only at the boundaries (velocity, accel).
+
+// Counting-sort scatter that also reorders the per-particle volume and keeps the
+// original index both in sortedPos.w (bit-cast) and as a plain int array.
+kernel void k_scatter_sph(device const uint*   cellId     [[buffer(0)]],
+                          device atomic_uint*  cellOffset [[buffer(1)]],
+                          device const float4* points     [[buffer(2)]],
+                          device const float*  volume     [[buffer(3)]],
+                          device float4*       sortedPos  [[buffer(4)]],
+                          device float*        sortedVol  [[buffer(5)]],
+                          device int*          sortedOrig [[buffer(6)]],
+                          constant Params&     P          [[buffer(7)]],
+                          uint                 gid        [[thread_position_in_grid]])
+{
+    if ((int)gid >= P.totalPoints) return;
+    uint lin  = cellId[gid];
+    uint slot = atomic_fetch_add_explicit(&cellOffset[lin], 1u, memory_order_relaxed);
+    float4 p = points[gid];
+    p.w = as_type<float>((int)gid);
+    sortedPos[slot]  = p;
+    sortedVol[slot]  = volume[gid];
+    sortedOrig[slot] = (int)gid;
+}
+
+// Neighbour count per sorted slot. Cells along x are adjacent in the grid
+// linearisation, so the 3x3x3 block collapses into 9 contiguous slot ranges
+// (one per (y,z) row) — 9 range lookups instead of 27 cell lookups, and each
+// range is one contiguous, coalesced run of sortedPos.
+// With P.maxNbr > 0 the count stops at the cap: the traversal order here and in
+// k_sph_build is identical, so both keep exactly the first maxNbr neighbours.
+kernel void k_nl_count_sorted(device const float4* sortedPos [[buffer(0)]],
+                              device const uint*   cellStart [[buffer(1)]],
+                              device uint*         counts    [[buffer(2)]],
+                              constant Params&     P         [[buffer(3)]],
+                              uint                 i         [[thread_position_in_grid]])
+{
+    if ((int)i >= P.nSearch) return;
+    const float h2 = P.r2 * P.r2;
+    const int cap = (P.maxNbr > 0) ? P.maxNbr : 0x7FFFFFFF;
+    float3 xi = sortedPos[i].xyz;
+    int cx = clamp((int)floor((xi.x - P.ox) * P.inv_cs), 0, P.dx - 1);
+    int cy = clamp((int)floor((xi.y - P.oy) * P.inv_cs), 0, P.dy - 1);
+    int cz = clamp((int)floor((xi.z - P.oz) * P.inv_cs), 0, P.dz - 1);
+    int xlo = max(cx - 1, 0), xhi = min(cx + 1, P.dx - 1);
+    int n = 0;
+    for (int dz = -1; dz <= 1 && n < cap; dz++) { int ncz = cz + dz; if (ncz < 0 || ncz >= P.dz) continue;
+    for (int dy = -1; dy <= 1 && n < cap; dy++) { int ncy = cy + dy; if (ncy < 0 || ncy >= P.dy) continue;
+        int row = (ncz * P.dy + ncy) * P.dx;
+        uint begin = cellStart[row + xlo];
+        uint end   = cellStart[row + xhi + 1];
+        for (uint s = begin; s < end && n < cap; s++) {
+            if (s == i) continue;
+            float3 e = xi - sortedPos[s].xyz;
+            if (dot(e, e) <= h2) n++;
+        }
+    }}
+    counts[i] = (uint)n;
+}
+
+// Fused build: ONE traversal emits the CSR neighbour list (ids + V_j*gradW with
+// V_j*W in .w) AND the SPH density, DFSPH factor and clamped constant-density
+// source. Replaces four separate traversals (density, factor, nl-count, nl-fill)
+// of the previous design; only the count pass above remains separate (the CSR
+// layout needs the totals first).
+// The traversal stops when the CSR row is full (k == nlStart[i+1]). Uncapped
+// that changes nothing (the row is exactly the neighbour count); with a capped
+// count it truncates density/factor/source along with the list, so the solve
+// stays self-consistent on the truncated neighbourhood.
+kernel void k_sph_build(device const float4* sortedPos  [[buffer(0)]],
+                        device const float*  sortedVol  [[buffer(1)]],
+                        device const uint*   cellStart  [[buffer(2)]],
+                        device const uint*   nlStart    [[buffer(3)]],
+                        device int*          nlId       [[buffer(4)]],
+                        device float4*       nlVgw      [[buffer(5)]],
+                        device float*        outDensity [[buffer(6)]],
+                        device float*        outFactor  [[buffer(7)]],
+                        device float*        outDensAdv [[buffer(8)]],
+                        constant Params&     P          [[buffer(9)]],
+                        uint                 i          [[thread_position_in_grid]])
+{
+    if ((int)i >= P.nSearch) return;
+    const float h  = P.r2;
+    const float h2 = h * h;
+    const float kW = 8.0f  / (3.14159265358979f * h * h * h);   // CubicKernel m_k
+    const float l  = 48.0f / (3.14159265358979f * h * h * h);   // CubicKernel m_l
+
+    float3 xi = sortedPos[i].xyz;
+    float  density = sortedVol[i] * kW;   // self: V_i * W(0)
+    float3 gpi = float3(0.0f);
+    float  sum = 0.0f;
+
+    int cx = clamp((int)floor((xi.x - P.ox) * P.inv_cs), 0, P.dx - 1);
+    int cy = clamp((int)floor((xi.y - P.oy) * P.inv_cs), 0, P.dy - 1);
+    int cz = clamp((int)floor((xi.z - P.oz) * P.inv_cs), 0, P.dz - 1);
+    int xlo = max(cx - 1, 0), xhi = min(cx + 1, P.dx - 1);
+    uint k = nlStart[i];
+    const uint kend = nlStart[i + 1];
+    for (int dz = -1; dz <= 1 && k < kend; dz++) { int ncz = cz + dz; if (ncz < 0 || ncz >= P.dz) continue;
+    for (int dy = -1; dy <= 1 && k < kend; dy++) { int ncy = cy + dy; if (ncy < 0 || ncy >= P.dy) continue;
+        int row = (ncz * P.dy + ncy) * P.dx;
+        uint begin = cellStart[row + xlo];
+        uint end   = cellStart[row + xhi + 1];
+        for (uint s = begin; s < end && k < kend; s++) {
+            if (s == i) continue;
+            float3 rvec = xi - sortedPos[s].xyz;
+            float d2 = dot(rvec, rvec);
+            if (d2 > h2) continue;
+            float rl = sqrt(d2);
+            float qd = rl / h;
+            float w;   // CubicKernel W
+            if (qd <= 0.5f) { float q2 = qd * qd; w = kW * (6.0f*q2*qd - 6.0f*q2 + 1.0f); }
+            else            { float f = 1.0f - qd; w = kW * (2.0f*f*f*f); }
+            float3 gw = float3(0.0f);   // CubicKernel gradW
+            if (rl > 1.0e-9f) {
+                float3 gradq = rvec / (rl * h);
+                if (qd <= 0.5f) gw = l * qd * (3.0f*qd - 2.0f) * gradq;
+                else { float f = 1.0f - qd; gw = l * (-f*f) * gradq; }
+            }
+            float Vj = sortedVol[s];
+            float3 Vgw = Vj * gw;
+            density += Vj * w;
+            sum += dot(Vgw, Vgw);
+            gpi += Vgw;
+            nlId[k]  = (int)s;
+            nlVgw[k] = float4(Vgw, Vj * w);
+            k++;
+        }
+    }}
+    sum += dot(gpi, gpi);
+    outDensity[i] = density;
+    outFactor[i]  = (sum > 1.0e-6f) ? (1.0f / sum) : 0.0f;
+    outDensAdv[i] = (isfinite(density) && density > 1.0f) ? density : 1.0f;
+}
+
+// XSPH velocity smoothing from the neighbour list: V_j*W_ij was precomputed into
+// nlVgw.w by k_sph_build, so this is a multiply-accumulate over the CSR list — no
+// grid traversal, no kernel evaluation. Velocities live in caller (original)
+// order; velOut is a separate buffer so the pass reads pre-smoothing values.
+kernel void k_xsph_nl(device const uint*   nlStart    [[buffer(0)]],
+                      device const int*    nlId       [[buffer(1)]],
+                      device const float4* nlVgw      [[buffer(2)]],
+                      device const int*    sortedOrig [[buffer(3)]],
+                      device const float*  velIn      [[buffer(4)]],
+                      device const float*  density    [[buffer(5)]],   // sorted order
+                      device float*        velOut     [[buffer(6)]],
+                      constant Params&     P          [[buffer(7)]],
+                      uint                 i          [[thread_position_in_grid]])
+{
+    if ((int)i >= P.nSearch) return;
+    int oi = sortedOrig[i];
+    float3 vi = float3(velIn[3*oi+0], velIn[3*oi+1], velIn[3*oi+2]);
+    float3 acc = float3(0.0f);
+    uint b = nlStart[i], e = nlStart[i+1];
+    for (uint s = b; s < e; s++) {
+        int oj = sortedOrig[nlId[s]];
+        float3 vj = float3(velIn[3*oj+0], velIn[3*oj+1], velIn[3*oj+2]);
+        acc += nlVgw[s].w * (vj - vi);   // V_j * W_ij * (v_j - v_i)
     }
     float di = max(density[i], 1.0e-6f);
     float3 vs = vi + P.viscosity * acc / di;
-    velOut[3*i+0] = vs.x; velOut[3*i+1] = vs.y; velOut[3*i+2] = vs.z;
+    velOut[3*oi+0] = vs.x; velOut[3*oi+1] = vs.y; velOut[3*oi+2] = vs.z;
 }
 
-// ─── GPU exclusive prefix-sum of per-cell counts (grid build) ────────────────
-// Single-thread serial scan: writes cellStart[0..nCells] (exclusive prefix; the last
-// element is the grand total) and seeds cellOffset[0..nCells) with the same offsets
-// (the scatter's running cursor). O(nCells) work on one thread — the point is not to
-// parallelise the scan but to keep the grid build entirely GPU-side so hash -> scan ->
-// scatter ride one command buffer with no CPU readback between them. nCells here is
-// ~1e3-1e4, so the serial cost (a few us) is far below the CPU-sync stall it removes.
-kernel void k_scan_cells(device const uint* counts     [[buffer(0)]],
-                         device uint*       cellStart   [[buffer(1)]],
-                         device uint*       cellOffset  [[buffer(2)]],
-                         constant Params&   P           [[buffer(3)]],
-                         uint               tid         [[thread_position_in_grid]])
+// Scatter the (sorted-order) pressure accel into the caller's tight float3 buffer.
+kernel void k_accel_scatter3(device const float4* accel      [[buffer(0)]],
+                             device const int*    sortedOrig [[buffer(1)]],
+                             device float*        out3       [[buffer(2)]],
+                             constant Params&     P          [[buffer(3)]],
+                             uint                 i          [[thread_position_in_grid]])
 {
-    if (tid != 0) return;
-    uint acc = 0;
-    int n = P.nCells;
-    for (int c = 0; c < n; c++) { cellStart[c] = acc; cellOffset[c] = acc; acc += counts[c]; }
-    cellStart[n] = acc;
+    if ((int)i >= P.nSearch) return;
+    int oi = sortedOrig[i];
+    float3 a = accel[i].xyz;
+    out3[3*oi+0] = a.x; out3[3*oi+1] = a.y; out3[3*oi+2] = a.z;
 }
 
-// ─── GPU exclusive prefix-sum for the CSR neighbour list ─────────────────────
-// Exclusive scan of the per-particle neighbour counts (length P.nSearch) into
-// outStart (length nSearch+1; outStart[nSearch] = grand total = number of pairs).
-// Single serial thread — keeps the CSR build GPU-side so k_nl_count -> scan ->
-// k_nl_fill need no CPU readback of the per-particle counts; only the one-word grand
-// total is read back afterwards, to size the pair buffers. Bit-identical to the old
-// CPU scan (same left-to-right uint32 accumulation); nSearch ~ 1e3-1e4.
-kernel void k_exscan(device const uint* count    [[buffer(0)]],
-                     device uint*       outStart [[buffer(1)]],
-                     constant Params&   P        [[buffer(2)]],
-                     uint               tid      [[thread_position_in_grid]])
+// ─── Sorted-order fast search (uniform radius, single set) ────────────────────
+// Same idea as k_search_fast / k_compact_fast, but thread i handles SORTED slot i:
+// the query position is one coalesced sortedPos load, adjacent threads sweep
+// adjacent cells (SIMD-coherent trip counts and cache-shared candidate reads),
+// and each 3x3x3 block collapses into 9 contiguous slot ranges. Counts and the
+// packed output stay keyed by ORIGINAL point index (the API's layout), via the
+// original id stashed in sortedPos.w.
+static inline int sweep_fast_sorted(uint i,
+                                    device const float4* sortedPos,
+                                    device const uint*   cellStart,
+                                    constant Params&     P,
+                                    device int*          out)
 {
-    if (tid != 0) return;
-    uint acc = 0;
-    int n = P.nSearch;
-    for (int i = 0; i < n; i++) { outStart[i] = acc; acc += count[i]; }
-    outStart[n] = acc;
+    float3 pi = sortedPos[i].xyz;
+    int cx = clamp((int)floor((pi.x - P.ox) * P.inv_cs), 0, P.dx - 1);
+    int cy = clamp((int)floor((pi.y - P.oy) * P.inv_cs), 0, P.dy - 1);
+    int cz = clamp((int)floor((pi.z - P.oz) * P.inv_cs), 0, P.dz - 1);
+    int xlo = max(cx - P.R, 0), xhi = min(cx + P.R, P.dx - 1);
+    int count = 0;
+    for (int dz = -P.R; dz <= P.R; dz++) { int ncz = cz + dz; if (ncz < 0 || ncz >= P.dz) continue;
+    for (int dy = -P.R; dy <= P.R; dy++) { int ncy = cy + dy; if (ncy < 0 || ncy >= P.dy) continue;
+        int row = (ncz * P.dy + ncy) * P.dx;
+        uint begin = cellStart[row + xlo];
+        uint end   = cellStart[row + xhi + 1];
+        for (uint s = begin; s < end; s++) {
+            if (s == i) continue;
+            float4 q = sortedPos[s];
+            float3 e = pi - q.xyz;
+            if (dot(e, e) <= P.r2) {
+                if (out != nullptr) out[count] = as_type<int>(q.w) - P.setOffsetJ;
+                count++;
+            }
+        }
+    }}
+    return count;
+}
+
+kernel void k_search_fast_sorted(device const float4* sortedPos [[buffer(0)]],
+                                 device const uint*   cellStart [[buffer(1)]],
+                                 device int*          scratch   [[buffer(2)]],
+                                 device uint*         outCount  [[buffer(3)]],
+                                 constant Params&     P         [[buffer(4)]],
+                                 uint                 i         [[thread_position_in_grid]])
+{
+    if ((int)i >= P.nSearch) return;
+    float3 pi = sortedPos[i].xyz;
+    int cx = clamp((int)floor((pi.x - P.ox) * P.inv_cs), 0, P.dx - 1);
+    int cy = clamp((int)floor((pi.y - P.oy) * P.inv_cs), 0, P.dy - 1);
+    int cz = clamp((int)floor((pi.z - P.oz) * P.inv_cs), 0, P.dz - 1);
+    int xlo = max(cx - P.R, 0), xhi = min(cx + P.R, P.dx - 1);
+    device int* sc = scratch + (uint)i * TNS_MAXNB;   // scratch row by SLOT
+    int count = 0;
+    for (int dz = -P.R; dz <= P.R; dz++) { int ncz = cz + dz; if (ncz < 0 || ncz >= P.dz) continue;
+    for (int dy = -P.R; dy <= P.R; dy++) { int ncy = cy + dy; if (ncy < 0 || ncy >= P.dy) continue;
+        int row = (ncz * P.dy + ncy) * P.dx;
+        uint begin = cellStart[row + xlo];
+        uint end   = cellStart[row + xhi + 1];
+        for (uint s = begin; s < end; s++) {
+            if (s == i) continue;
+            float4 q = sortedPos[s];
+            float3 e = pi - q.xyz;
+            if (dot(e, e) <= P.r2) {
+                if (count < TNS_MAXNB) sc[count] = as_type<int>(q.w) - P.setOffsetJ;
+                count++;
+            }
+        }
+    }}
+    outCount[as_type<int>(sortedPos[i].w) - P.setOffsetI] = (uint)count;   // count by ORIGINAL index
+}
+
+// Pack the slot-order scratch rows into the original-index-ordered [count, ids...]
+// runs, using the GPU-scanned offsets. Overflowed rows are re-swept into place.
+kernel void k_compact_fast_sorted(device const float4* sortedPos   [[buffer(0)]],
+                                  device const uint*   cellStart   [[buffer(1)]],
+                                  device const int*    scratch     [[buffer(2)]],
+                                  device const uint*   outCount    [[buffer(3)]],
+                                  device const int*    blockOffset [[buffer(4)]],
+                                  device int*          block       [[buffer(5)]],
+                                  constant Params&     P           [[buffer(6)]],
+                                  uint                 i           [[thread_position_in_grid]])
+{
+    if ((int)i >= P.nSearch) return;
+    int oi   = as_type<int>(sortedPos[i].w) - P.setOffsetI;
+    int base = blockOffset[oi];
+    int cnt  = (int)outCount[oi];
+    block[base] = cnt;
+    if (cnt <= TNS_MAXNB) {
+        device const int* sc = scratch + (uint)i * TNS_MAXNB;
+        for (int k = 0; k < cnt; k++) block[base + 1 + k] = sc[k];
+    } else {
+        sweep_fast_sorted(i, sortedPos, cellStart, P, block + base + 1);
+    }
 }
 
 )METAL";
@@ -894,8 +1028,6 @@ struct MetalContext {
     id<MTLComputePipelineState> psoCount   = nil;
     id<MTLComputePipelineState> psoWrite   = nil;
     id<MTLComputePipelineState> psoScatterFast = nil;
-    id<MTLComputePipelineState> psoSearchFast  = nil;
-    id<MTLComputePipelineState> psoCompactFast = nil;
     id<MTLComputePipelineState> psoDensity     = nil;
     id<MTLComputePipelineState> psoFactor      = nil;
     id<MTLComputePipelineState> psoDensityAdv  = nil;
@@ -905,11 +1037,17 @@ struct MetalContext {
     id<MTLComputePipelineState> psoNlFill  = nil;
     id<MTLComputePipelineState> psoPaNl    = nil;
     id<MTLComputePipelineState> psoPuNl    = nil;
-    id<MTLComputePipelineState> psoDensadvClamp = nil;
-    id<MTLComputePipelineState> psoAccelCopy3   = nil;
-    id<MTLComputePipelineState> psoXsph         = nil;
-    id<MTLComputePipelineState> psoScanCells    = nil;   // GPU grid prefix-sum
-    id<MTLComputePipelineState> psoExscan       = nil;   // GPU neighbour-list prefix-sum (CSR)
+    // Parallel scan + sorted-space SPH kernels (resident solve).
+    id<MTLComputePipelineState> psoScanPartial  = nil;
+    id<MTLComputePipelineState> psoScanBlocks   = nil;
+    id<MTLComputePipelineState> psoScanFixup    = nil;
+    id<MTLComputePipelineState> psoScatterSph   = nil;
+    id<MTLComputePipelineState> psoNlCountSorted = nil;
+    id<MTLComputePipelineState> psoSphBuild     = nil;
+    id<MTLComputePipelineState> psoXsphNl       = nil;
+    id<MTLComputePipelineState> psoAccelScatter3 = nil;
+    id<MTLComputePipelineState> psoSearchFastSorted  = nil;
+    id<MTLComputePipelineState> psoCompactFastSorted = nil;
     bool ok = false;
     std::string error;
 };
@@ -972,8 +1110,6 @@ static void build_context(MetalContext& ctx, id<MTLDevice> dev, id<MTLCommandQue
         if (!make_pso("k_count",   ctx.psoCount))   return;
         if (!make_pso("k_write",   ctx.psoWrite))   return;
         if (!make_pso("k_scatter_fast", ctx.psoScatterFast)) return;
-        if (!make_pso("k_search_fast",  ctx.psoSearchFast))  return;
-        if (!make_pso("k_compact_fast", ctx.psoCompactFast)) return;
         if (!make_pso("k_density",      ctx.psoDensity))     return;
         if (!make_pso("k_factor",       ctx.psoFactor))      return;
         if (!make_pso("k_density_adv",  ctx.psoDensityAdv))  return;
@@ -983,11 +1119,16 @@ static void build_context(MetalContext& ctx, id<MTLDevice> dev, id<MTLCommandQue
         if (!make_pso("k_nl_fill",  ctx.psoNlFill))  return;
         if (!make_pso("k_pa_nl",    ctx.psoPaNl))    return;
         if (!make_pso("k_pu_nl",    ctx.psoPuNl))    return;
-        if (!make_pso("k_densadv_clamp", ctx.psoDensadvClamp)) return;
-        if (!make_pso("k_accel_copy3",   ctx.psoAccelCopy3))   return;
-        if (!make_pso("k_xsph",          ctx.psoXsph))         return;
-        if (!make_pso("k_scan_cells",      ctx.psoScanCells))     return;
-        if (!make_pso("k_exscan",          ctx.psoExscan))        return;
+        if (!make_pso("k_scan_partial",    ctx.psoScanPartial))   return;
+        if (!make_pso("k_scan_blocks",     ctx.psoScanBlocks))    return;
+        if (!make_pso("k_scan_fixup",      ctx.psoScanFixup))     return;
+        if (!make_pso("k_scatter_sph",     ctx.psoScatterSph))    return;
+        if (!make_pso("k_nl_count_sorted", ctx.psoNlCountSorted)) return;
+        if (!make_pso("k_sph_build",       ctx.psoSphBuild))      return;
+        if (!make_pso("k_xsph_nl",         ctx.psoXsphNl))        return;
+        if (!make_pso("k_accel_scatter3",  ctx.psoAccelScatter3)) return;
+        if (!make_pso("k_search_fast_sorted",  ctx.psoSearchFastSorted))  return;
+        if (!make_pso("k_compact_fast_sorted", ctx.psoCompactFastSorted)) return;
 
         ctx.ok = true;
     }
@@ -1024,12 +1165,16 @@ struct ParamsC {
     float aij_scale;
     int   divergence;
     float viscosity;   // mirrors Params (MSL); XSPH strength, 0 = off
+    int   maxNbr;      // mirrors Params (MSL); neighbour cap, <=0 = exact
 };
 
 static void dispatch1d(id<MTLComputeCommandEncoder> enc,
                        id<MTLComputePipelineState> pso, NSUInteger n)
 {
+    // 256-wide threadgroups: full SIMD occupancy without starving the register
+    // file the way max-width (1024) groups can for the heavier sweep kernels.
     NSUInteger tpg = pso.maxTotalThreadsPerThreadgroup;
+    if (tpg > 256) tpg = 256;
     if (tpg > n) tpg = (n == 0 ? 1 : n);
     [enc setComputePipelineState:pso];
     [enc dispatchThreads:MTLSizeMake(n, 1, 1)
@@ -1043,13 +1188,17 @@ static void dispatch1d(id<MTLComputeCommandEncoder> enc,
 struct GpuBuffers {
     id<MTLBuffer> points, radii, pointSet, cellId, counts, cellStart, cellOffset;
     id<MTLBuffer> sPoints, sRadii, sSet, sOrig;
-    id<MTLBuffer> count, block, blockOff, scratch;
+    id<MTLBuffer> count, scratch;
     id<MTLBuffer> volume, density, bVol, bXj, velocity;
     id<MTLBuffer> velSmooth;                   // XSPH double-buffer (velOut)
     id<MTLBuffer> pRho2, accel, densAdv, factorBuf, err;
     id<MTLBuffer> nlStart, nlId, nlVgw, bVgw;   // precomputed neighbour list for the solve
+    id<MTLBuffer> sVol, blockSums;              // sorted volume + parallel-scan scratch
+    // Zero-copy neighbour-search results: one packed-block + offsets buffer per
+    // search pair, handed to the caller as pointers into unified memory (valid
+    // until the next metal_neighbor_search call in the process).
+    std::vector<id<MTLBuffer>> blockPair, blockOffPair;
     std::vector<uint32_t> cellStartHost, nlStartHost;
-    std::vector<uint32_t> nlCountHost;
 };
 
 static GpuBuffers& buffers()
@@ -1090,6 +1239,53 @@ static void ensure(id<MTLDevice> dev, __strong id<MTLBuffer>& buf, size_t bytes)
     }
 }
 
+// Mirrors the MSL ScanArgs struct.
+struct ScanArgsC { uint32_t n, numBlocks, seedCopy, addPer; };
+
+// Encode a parallel exclusive prefix-sum of `in` (n uints) into `out` (n+1 uints;
+// out[n] = grand total) onto `cmd`. If `seed` is non-nil the offsets are also
+// written there (the grid scatter's running cursor). addPer is added to every
+// element (1 -> offsets for packed [count, ids...] runs). Three dispatches, no
+// CPU sync; B.blockSums is (re)used as scratch.
+static void encode_scan(id<MTLCommandBuffer> cmd, MetalContext& ctx, GpuBuffers& B,
+                        id<MTLBuffer> in, id<MTLBuffer> out, id<MTLBuffer> seed, uint32_t n,
+                        uint32_t addPer = 0)
+{
+    const uint32_t numBlocks = (n + 255u) / 256u;
+    ensure(ctx.device, B.blockSums, sizeof(uint32_t) * (size_t)numBlocks);
+    ScanArgsC A{ n, numBlocks, seed != nil ? 1u : 0u, addPer };
+
+    id<MTLComputeCommandEncoder> e1 = [cmd computeCommandEncoder];
+    [e1 setComputePipelineState:ctx.psoScanPartial];
+    [e1 setBuffer:in offset:0 atIndex:0];
+    [e1 setBuffer:out offset:0 atIndex:1];        // reused as per-element partials
+    [e1 setBuffer:B.blockSums offset:0 atIndex:2];
+    [e1 setBytes:&A length:sizeof(A) atIndex:3];
+    [e1 dispatchThreadgroups:MTLSizeMake(numBlocks, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e1 endEncoding];
+
+    id<MTLComputeCommandEncoder> e2 = [cmd computeCommandEncoder];
+    [e2 setComputePipelineState:ctx.psoScanBlocks];
+    [e2 setBuffer:B.blockSums offset:0 atIndex:0];
+    [e2 setBytes:&A length:sizeof(A) atIndex:1];
+    [e2 dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e2 endEncoding];
+
+    id<MTLComputeCommandEncoder> e3 = [cmd computeCommandEncoder];
+    [e3 setComputePipelineState:ctx.psoScanFixup];
+    [e3 setBuffer:out offset:0 atIndex:0];        // partials in place
+    [e3 setBuffer:B.blockSums offset:0 atIndex:1];
+    [e3 setBuffer:out offset:0 atIndex:2];
+    [e3 setBuffer:(seed != nil ? seed : out) offset:0 atIndex:3];
+    [e3 setBuffer:in offset:0 atIndex:4];
+    [e3 setBytes:&A length:sizeof(A) atIndex:5];
+    [e3 dispatchThreads:MTLSizeMake(n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e3 endEncoding];
+}
+
 } // anonymous namespace
 
 namespace tns { namespace internals {
@@ -1123,7 +1319,7 @@ bool metal_neighbor_search(const MetalSearchRequest& req,
     static const bool kProfile = std::getenv("TNS_PROFILE") != nullptr;
     auto pnow = []{ return std::chrono::high_resolution_clock::now(); };
     auto pms  = [](auto a, auto b){ return std::chrono::duration<double, std::milli>(b - a).count(); };
-    double tFill = 0, tHash = 0, tScan = 0, tScatter = 0, tCount = 0, tWrite = 0;
+    double tFill = 0, tGrid = 0, tCount = 0, tWrite = 0;
     auto pt0 = pnow();
 
     @autoreleasepool {
@@ -1176,7 +1372,7 @@ bool metal_neighbor_search(const MetalSearchRequest& req,
         P.totalPoints = N;
         P.r2 = req.radius * req.radius;
 
-        // ── 1. hash ──────────────────────────────────────────────────────────
+        // ── 1. grid build: hash -> parallel GPU scan -> scatter, ONE command buffer ──
         auto th0 = pnow();
         {
             id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
@@ -1187,58 +1383,47 @@ bool metal_neighbor_search(const MetalSearchRequest& req,
             [enc setBytes:&P length:sizeof(P) atIndex:3];
             dispatch1d(enc, ctx.psoHash, (NSUInteger)N);
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
-        }
-        tHash = pms(th0, pnow());
-
-        // ── 2. exclusive scan of counts -> cellStart (size nCells+1) on CPU ───
-        auto ts0 = pnow();
-        const uint32_t* counts = (const uint32_t*)B.counts.contents;
-        B.cellStartHost.resize((size_t)nCells + 1);
-        uint32_t acc = 0;
-        for (int c = 0; c < nCells; c++) { B.cellStartHost[c] = acc; acc += counts[c]; }
-        B.cellStartHost[nCells] = acc;
-        std::memcpy(B.cellStart.contents,  B.cellStartHost.data(), sizeof(uint32_t) * (size_t)(nCells + 1));
-        std::memcpy(B.cellOffset.contents, B.cellStartHost.data(), sizeof(uint32_t) * (size_t)nCells); // running cursor
-        tScan = pms(ts0, pnow());
-
-        // ── 3. scatter (counting sort + payload reorder) ────────────────────────
-        auto tsc0 = pnow();
-        {
-            id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            encode_scan(cmd, ctx, B, B.counts, B.cellStart, B.cellOffset, (uint32_t)nCells);
+            id<MTLComputeCommandEncoder> esc = [cmd computeCommandEncoder];
             if (fast) {
-                [enc setBuffer:B.cellId     offset:0 atIndex:0];
-                [enc setBuffer:B.cellOffset offset:0 atIndex:1];
-                [enc setBuffer:B.points     offset:0 atIndex:2];
-                [enc setBuffer:B.sPoints    offset:0 atIndex:3];
-                [enc setBytes:&P length:sizeof(P) atIndex:4];
-                dispatch1d(enc, ctx.psoScatterFast, (NSUInteger)N);
+                [esc setBuffer:B.cellId     offset:0 atIndex:0];
+                [esc setBuffer:B.cellOffset offset:0 atIndex:1];
+                [esc setBuffer:B.points     offset:0 atIndex:2];
+                [esc setBuffer:B.sPoints    offset:0 atIndex:3];
+                [esc setBytes:&P length:sizeof(P) atIndex:4];
+                dispatch1d(esc, ctx.psoScatterFast, (NSUInteger)N);
             } else {
-                [enc setBuffer:B.cellId     offset:0 atIndex:0];
-                [enc setBuffer:B.cellOffset offset:0 atIndex:1];
-                [enc setBuffer:B.points     offset:0 atIndex:2];
-                [enc setBuffer:B.radii      offset:0 atIndex:3];
-                [enc setBuffer:B.pointSet   offset:0 atIndex:4];
-                [enc setBuffer:B.sPoints    offset:0 atIndex:5];
-                [enc setBuffer:B.sRadii     offset:0 atIndex:6];
-                [enc setBuffer:B.sSet       offset:0 atIndex:7];
-                [enc setBuffer:B.sOrig      offset:0 atIndex:8];
-                [enc setBytes:&P length:sizeof(P) atIndex:9];
-                dispatch1d(enc, ctx.psoScatter, (NSUInteger)N);
+                [esc setBuffer:B.cellId     offset:0 atIndex:0];
+                [esc setBuffer:B.cellOffset offset:0 atIndex:1];
+                [esc setBuffer:B.points     offset:0 atIndex:2];
+                [esc setBuffer:B.radii      offset:0 atIndex:3];
+                [esc setBuffer:B.pointSet   offset:0 atIndex:4];
+                [esc setBuffer:B.sPoints    offset:0 atIndex:5];
+                [esc setBuffer:B.sRadii     offset:0 atIndex:6];
+                [esc setBuffer:B.sSet       offset:0 atIndex:7];
+                [esc setBuffer:B.sOrig      offset:0 atIndex:8];
+                [esc setBytes:&P length:sizeof(P) atIndex:9];
+                dispatch1d(esc, ctx.psoScatter, (NSUInteger)N);
             }
-            [enc endEncoding];
+            [esc endEncoding];
             [cmd commit];
             [cmd waitUntilCompleted];
         }
-        tScatter = pms(tsc0, pnow());
+        tGrid = pms(th0, pnow());
 
-        // ── 4. per-pair neighbour search (count pass, CPU scan, write pass) ──────
+        // ── 2. per-pair neighbour search ─────────────────────────────────────────
+        // Results are ZERO-COPY: the packed [count, ids...] runs and their offsets
+        // live in per-pair unified-memory buffers; MetalPairResult carries pointers
+        // into them (valid until the next call — the buffers are reused).
+        if (B.blockPair.size() < req.pairs.size()) {
+            B.blockPair.resize(req.pairs.size(), nil);
+            B.blockOffPair.resize(req.pairs.size(), nil);
+        }
         out.pairs.clear();
         out.pairs.reserve(req.pairs.size());
 
-        for (const MetalSearchPair& pr : req.pairs) {
+        for (size_t pi = 0; pi < req.pairs.size(); pi++) {
+            const MetalSearchPair& pr = req.pairs[pi];
             const int nSearch = req.set_offsets[pr.set_i + 1] - req.set_offsets[pr.set_i];
 
             ParamsC PP = P;
@@ -1249,27 +1434,62 @@ bool metal_neighbor_search(const MetalSearchRequest& req,
 
             MetalPairResult res;
             res.set_i = pr.set_i; res.set_j = pr.set_j;
-            res.block_offset.resize((size_t)nSearch + 1);
 
-            if (nSearch == 0) { res.block_offset[0] = 0; out.pairs.push_back(std::move(res)); continue; }
+            if (nSearch == 0) { out.pairs.push_back(std::move(res)); continue; }
 
             ensure(dev, B.count, sizeof(uint32_t) * (size_t)nSearch);
-            if (fast) ensure(dev, B.scratch, sizeof(int) * (size_t)nSearch * (size_t)kMaxNb);
+            ensure(dev, B.blockOffPair[pi], sizeof(int) * (size_t)(nSearch + 1));
+            id<MTLBuffer> blockOff = B.blockOffPair[pi];
 
-            // pass 1: single sweep (fast = count + store to scratch; general = count only)
+            int blockAcc = 0;
             auto tc0 = pnow();
-            {
-                id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
-                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-                if (fast) {
-                    [enc setBuffer:B.points    offset:0 atIndex:0];
-                    [enc setBuffer:B.sPoints   offset:0 atIndex:1];
-                    [enc setBuffer:B.cellStart offset:0 atIndex:2];
-                    [enc setBuffer:B.scratch   offset:0 atIndex:3];
-                    [enc setBuffer:B.count     offset:0 atIndex:4];
-                    [enc setBytes:&PP length:sizeof(PP) atIndex:5];
-                    dispatch1d(enc, ctx.psoSearchFast, (NSUInteger)nSearch);
-                } else {
+            if (fast) {
+                // Sorted sweep: thread = sorted slot (SIMD-coherent, coalesced),
+                // counts keyed by original index; the [count, ids...] offsets come
+                // from the GPU scan (count+1 per point) in the same command buffer.
+                PP.nSearch = N;   // every slot is a query in the single-set case
+                ensure(dev, B.scratch, sizeof(int) * (size_t)N * (size_t)kMaxNb);
+                {
+                    id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+                    [enc setBuffer:B.sPoints   offset:0 atIndex:0];
+                    [enc setBuffer:B.cellStart offset:0 atIndex:1];
+                    [enc setBuffer:B.scratch   offset:0 atIndex:2];
+                    [enc setBuffer:B.count     offset:0 atIndex:3];
+                    [enc setBytes:&PP length:sizeof(PP) atIndex:4];
+                    dispatch1d(enc, ctx.psoSearchFastSorted, (NSUInteger)N);
+                    [enc endEncoding];
+                    encode_scan(cmd, ctx, B, B.count, blockOff, nil, (uint32_t)nSearch, /*addPer=*/1);
+                    [cmd commit];
+                    [cmd waitUntilCompleted];
+                }
+                tCount += pms(tc0, pnow());
+                blockAcc = (int)((const uint32_t*)blockOff.contents)[nSearch];
+
+                ensure(dev, B.blockPair[pi], sizeof(int) * (size_t)blockAcc);
+                auto tw0 = pnow();
+                {
+                    id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+                    [enc setBuffer:B.sPoints        offset:0 atIndex:0];
+                    [enc setBuffer:B.cellStart      offset:0 atIndex:1];
+                    [enc setBuffer:B.scratch        offset:0 atIndex:2];
+                    [enc setBuffer:B.count          offset:0 atIndex:3];
+                    [enc setBuffer:blockOff         offset:0 atIndex:4];
+                    [enc setBuffer:B.blockPair[pi]  offset:0 atIndex:5];
+                    [enc setBytes:&PP length:sizeof(PP) atIndex:6];
+                    dispatch1d(enc, ctx.psoCompactFastSorted, (NSUInteger)N);
+                    [enc endEncoding];
+                    [cmd commit];
+                    [cmd waitUntilCompleted];
+                }
+                tWrite += pms(tw0, pnow());
+            } else {
+                // General path (multi-set / variable radius): count sweep, CPU scan
+                // of the offsets (written straight into the shared buffer), write sweep.
+                {
+                    id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
                     [enc setBuffer:B.points  offset:0 atIndex:0];
                     [enc setBuffer:B.radii   offset:0 atIndex:1];
                     [enc setBuffer:B.sPoints offset:0 atIndex:2];
@@ -1280,43 +1500,25 @@ bool metal_neighbor_search(const MetalSearchRequest& req,
                     [enc setBuffer:B.count   offset:0 atIndex:7];
                     [enc setBytes:&PP length:sizeof(PP) atIndex:8];
                     dispatch1d(enc, ctx.psoCount, (NSUInteger)nSearch);
+                    [enc endEncoding];
+                    [cmd commit];
+                    [cmd waitUntilCompleted];
                 }
-                [enc endEncoding];
-                [cmd commit];
-                [cmd waitUntilCompleted];
-            }
-            tCount += pms(tc0, pnow());
+                tCount += pms(tc0, pnow());
 
-            // CPU prefix sum -> block offsets ( each run is [count, ids...] -> count+1 ints )
-            const uint32_t* cnt = (const uint32_t*)B.count.contents;
-            int blockAcc = 0;
-            for (int i = 0; i < nSearch; i++) {
-                res.block_offset[i] = blockAcc;
-                blockAcc += (int)cnt[i] + 1;
-            }
-            res.block_offset[nSearch] = blockAcc;
+                const uint32_t* cnt = (const uint32_t*)B.count.contents;
+                int* off = (int*)blockOff.contents;
+                for (int i = 0; i < nSearch; i++) {
+                    off[i] = blockAcc;
+                    blockAcc += (int)cnt[i] + 1;
+                }
+                off[nSearch] = blockAcc;
 
-            res.block.resize((size_t)blockAcc);
-            ensure(dev, B.block,    sizeof(int) * (size_t)blockAcc);
-            ensure(dev, B.blockOff, sizeof(int) * (size_t)(nSearch + 1));
-            std::memcpy(B.blockOff.contents, res.block_offset.data(), sizeof(int) * (size_t)(nSearch + 1));
-
-            // pass 2: emit packed lists (fast = compact scratch rows; general = write sweep)
-            auto tw0 = pnow();
-            {
-                id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
-                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-                if (fast) {
-                    [enc setBuffer:B.points    offset:0 atIndex:0];
-                    [enc setBuffer:B.sPoints   offset:0 atIndex:1];
-                    [enc setBuffer:B.cellStart offset:0 atIndex:2];
-                    [enc setBuffer:B.scratch   offset:0 atIndex:3];
-                    [enc setBuffer:B.count     offset:0 atIndex:4];
-                    [enc setBuffer:B.blockOff  offset:0 atIndex:5];
-                    [enc setBuffer:B.block     offset:0 atIndex:6];
-                    [enc setBytes:&PP length:sizeof(PP) atIndex:7];
-                    dispatch1d(enc, ctx.psoCompactFast, (NSUInteger)nSearch);
-                } else {
+                ensure(dev, B.blockPair[pi], sizeof(int) * (size_t)blockAcc);
+                auto tw0 = pnow();
+                {
+                    id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
                     [enc setBuffer:B.points   offset:0 atIndex:0];
                     [enc setBuffer:B.radii    offset:0 atIndex:1];
                     [enc setBuffer:B.sPoints  offset:0 atIndex:2];
@@ -1324,27 +1526,28 @@ bool metal_neighbor_search(const MetalSearchRequest& req,
                     [enc setBuffer:B.sSet     offset:0 atIndex:4];
                     [enc setBuffer:B.sOrig    offset:0 atIndex:5];
                     [enc setBuffer:B.cellStart offset:0 atIndex:6];
-                    [enc setBuffer:B.block    offset:0 atIndex:7];
-                    [enc setBuffer:B.blockOff offset:0 atIndex:8];
+                    [enc setBuffer:B.blockPair[pi] offset:0 atIndex:7];
+                    [enc setBuffer:blockOff   offset:0 atIndex:8];
                     [enc setBytes:&PP length:sizeof(PP) atIndex:9];
                     dispatch1d(enc, ctx.psoWrite, (NSUInteger)nSearch);
+                    [enc endEncoding];
+                    [cmd commit];
+                    [cmd waitUntilCompleted];
                 }
-                [enc endEncoding];
-                [cmd commit];
-                [cmd waitUntilCompleted];
+                tWrite += pms(tw0, pnow());
             }
 
-            tWrite += pms(tw0, pnow());
-            std::memcpy(res.block.data(), B.block.contents, sizeof(int) * (size_t)blockAcc);
+            res.block_ptr        = (const int*)B.blockPair[pi].contents;
+            res.block_offset_ptr = (const int*)blockOff.contents;
             out.pairs.push_back(std::move(res));
         }
     }
 
     if (kProfile) {
         std::fprintf(stderr,
-            "[TNS_PROFILE] N=%d nCells=%d  fill=%.2f hash=%.2f scan=%.2f scatter=%.2f count=%.2f write=%.2f  total=%.2f ms\n",
-            N, nCells, tFill, tHash, tScan, tScatter, tCount, tWrite,
-            tFill + tHash + tScan + tScatter + tCount + tWrite);
+            "[TNS_PROFILE] N=%d nCells=%d  fill=%.2f grid=%.2f count=%.2f write=%.2f  total=%.2f ms\n",
+            N, nCells, tFill, tGrid, tCount, tWrite,
+            tFill + tGrid + tCount + tWrite);
     }
     return true;
 }
@@ -1691,6 +1894,12 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
     if (nCellsL <= 0 || nCellsL > 300000000L) { error = "solve_gpu: bad grid size"; return false; }
     const int nCells = (int)nCellsL;
 
+    static const bool kProfile = std::getenv("TNS_PROFILE") != nullptr;
+    auto pnow = []{ return std::chrono::high_resolution_clock::now(); };
+    auto pms  = [](auto a, auto b){ return std::chrono::duration<double, std::milli>(b - a).count(); };
+    auto pt0 = pnow();
+    double tBuild = 0, tSolve = 0;
+
     @autoreleasepool {
         id<MTLDevice> dev = ctx.device;
         GpuBuffers& B = buffers();
@@ -1706,31 +1915,33 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         P.inv_cs = 1.0f / req.h;
         P.dx = req.grid_dims[0]; P.dy = req.grid_dims[1]; P.dz = req.grid_dims[2];
         P.R = 1; P.nCells = nCells; P.totalPoints = N; P.nSearch = N; P.r2 = req.h;
+        P.maxNbr = req.max_neighbors;   // <=0 = exact CSR; >0 caps rows (see header)
 
-        // ── Scratch. The grid prefix-sum moves onto the GPU (k_scan_cells; cellStart
-        //    length nCells+1 is known a priori, so the whole grid build stays GPU-side).
-        //    The neighbour-list prefix-sum also moves onto the GPU (k_exscan), keeping the
-        //    EXACT CSR layout — the only remaining host dependency is one word (the pair
-        //    total nlStart[N]) read back to size nlId/nlVgw, which splits the solve into
-        //    two command buffers (two waits) instead of the old eight. No neighbour cap. ──
+        // ── Scratch. Everything internal lives in SORTED (cell) order: the scatter
+        //    reorders position + volume + original id, the fused build emits the CSR
+        //    list, density, factor and the clamped source in ONE traversal, and the
+        //    Jacobi state (pRho2 / accel / densAdv / factor) is indexed by sorted slot
+        //    so neighbour gathers stay cache-local. Both prefix-sums are parallel GPU
+        //    scans. The only host dependency is the one-word pair total nlStart[N],
+        //    read back to size nlId/nlVgw (exact CSR by default; req.max_neighbors
+        //    caps rows at the count) — hence two command buffers / two waits.
+        //    Results are scattered to caller order at the end. ──
         ensure(dev, B.cellId,     sizeof(uint32_t) * (size_t)N);
         ensure(dev, B.counts,     sizeof(uint32_t) * (size_t)nCells);
         ensure(dev, B.cellStart,  sizeof(uint32_t) * (size_t)(nCells + 1));
         ensure(dev, B.cellOffset, sizeof(uint32_t) * (size_t)nCells);
         ensure(dev, B.sPoints,    sizeof(float) * 4 * (size_t)N);
+        ensure(dev, B.sVol,       sizeof(float) * (size_t)N);
+        ensure(dev, B.sOrig,      sizeof(int) * (size_t)N);
         ensure(dev, B.density,    sizeof(float) * (size_t)N);
         ensure(dev, B.factorBuf,  sizeof(float) * (size_t)N);
         ensure(dev, B.densAdv,    sizeof(float) * (size_t)N);
         ensure(dev, B.pRho2,      sizeof(float) * (size_t)N);
         ensure(dev, B.accel,      sizeof(float) * 4 * (size_t)N);
-        ensure(dev, B.err,        sizeof(float) * (size_t)N);
-        ensure(dev, B.bVol,       sizeof(float) * (size_t)N);           // unused (no boundary)
-        ensure(dev, B.bXj,        sizeof(float) * 3 * (size_t)N);
+        ensure(dev, B.err,        sizeof(float));
         ensure(dev, B.count,      sizeof(uint32_t) * (size_t)N);
         ensure(dev, B.nlStart,    sizeof(uint32_t) * (size_t)(N + 1));
-        ensure(dev, B.bVgw,       sizeof(float) * 4 * (size_t)N);
-        // B.nlId / B.nlVgw are sized to the EXACT pair total (nlStart[N]) after CB1's
-        // neighbour-count exclusive scan — a one-word readback, exact CSR, no cap.
+        ensure(dev, B.bVgw,       sizeof(float) * 4);   // bound but unread (no boundary)
         if (doXsph) ensure(dev, B.velSmooth, sizeof(float) * 3 * (size_t)N);
 
         // Host-side buffer prep. These writes precede [cmd commit], so the GPU sees them
@@ -1740,7 +1951,7 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         std::memset(B.pRho2.contents,  0, sizeof(float) * (size_t)N);
         *(float*)B.err.contents = 0.0f;
 
-        ParamsC Pp = P; Pp.hasBoundary = 0; Pp.viscosity = req.viscosity;   // grid/density/NL build
+        ParamsC Pp = P; Pp.hasBoundary = 0; Pp.viscosity = req.viscosity;   // grid + fused build
         ParamsC Ps = P; Ps.hasBoundary = 0; Ps.dt = req.dt; Ps.density0 = req.density0;
         Ps.divergence = 0; Ps.aij_scale = req.dt * req.dt;                   // pressure solve (h^2)
 
@@ -1748,8 +1959,9 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         //    Metal serialises compute encoders within one buffer and auto-tracks buffer
         //    hazards between them, so back-to-back phases need no CPU sync. ──────────────
 
-        // grid: hash (counts pre-zeroed) -> GPU exclusive scan -> scatter into sPoints.
-        auto enc_grid = [&](id<MTLCommandBuffer> cmd){
+        // grid: hash (counts pre-zeroed) -> parallel scan -> scatter pos/vol/orig into
+        // cell order; then per-slot neighbour count -> parallel scan into nlStart.
+        auto enc_grid_count = [&](id<MTLCommandBuffer> cmd){
             id<MTLComputeCommandEncoder> eh = [cmd computeCommandEncoder];
             [eh setBuffer:pts offset:0 atIndex:0];
             [eh setBuffer:B.cellId offset:0 atIndex:1];
@@ -1757,100 +1969,63 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
             [eh setBytes:&P length:sizeof(P) atIndex:3];
             dispatch1d(eh, ctx.psoHash, (NSUInteger)N);
             [eh endEncoding];
-            id<MTLComputeCommandEncoder> es = [cmd computeCommandEncoder];   // counts -> cellStart(+seed cellOffset)
-            [es setBuffer:B.counts offset:0 atIndex:0];
-            [es setBuffer:B.cellStart offset:0 atIndex:1];
-            [es setBuffer:B.cellOffset offset:0 atIndex:2];
-            [es setBytes:&P length:sizeof(P) atIndex:3];
-            dispatch1d(es, ctx.psoScanCells, 1);   // single serial thread; replaces the CPU scan+readback
-            [es endEncoding];
+            encode_scan(cmd, ctx, B, B.counts, B.cellStart, B.cellOffset, (uint32_t)nCells);
             id<MTLComputeCommandEncoder> esc = [cmd computeCommandEncoder];
             [esc setBuffer:B.cellId offset:0 atIndex:0];
             [esc setBuffer:B.cellOffset offset:0 atIndex:1];
             [esc setBuffer:pts offset:0 atIndex:2];
-            [esc setBuffer:B.sPoints offset:0 atIndex:3];
-            [esc setBytes:&P length:sizeof(P) atIndex:4];
-            dispatch1d(esc, ctx.psoScatterFast, (NSUInteger)N);
+            [esc setBuffer:vol offset:0 atIndex:3];
+            [esc setBuffer:B.sPoints offset:0 atIndex:4];
+            [esc setBuffer:B.sVol offset:0 atIndex:5];
+            [esc setBuffer:B.sOrig offset:0 atIndex:6];
+            [esc setBytes:&P length:sizeof(P) atIndex:7];
+            dispatch1d(esc, ctx.psoScatterSph, (NSUInteger)N);
             [esc endEncoding];
+            id<MTLComputeCommandEncoder> ec = [cmd computeCommandEncoder];
+            [ec setBuffer:B.sPoints offset:0 atIndex:0];
+            [ec setBuffer:B.cellStart offset:0 atIndex:1];
+            [ec setBuffer:B.count offset:0 atIndex:2];
+            [ec setBytes:&Pp length:sizeof(Pp) atIndex:3];
+            dispatch1d(ec, ctx.psoNlCountSorted, (NSUInteger)N);
+            [ec endEncoding];
+            encode_scan(cmd, ctx, B, B.count, B.nlStart, nil, (uint32_t)N);
         };
 
-        // density -> factor -> constant-density source clamp (B.density hazard tracked).
-        auto enc_dfac = [&](id<MTLCommandBuffer> cmd){
-            auto bind_pp = [&](id<MTLComputeCommandEncoder> enc,
-                               id<MTLComputePipelineState> pso, id<MTLBuffer> dstOut){
-                [enc setBuffer:pts offset:0 atIndex:0];
-                [enc setBuffer:B.sPoints offset:0 atIndex:1];
-                [enc setBuffer:vol offset:0 atIndex:2];
-                [enc setBuffer:B.cellStart offset:0 atIndex:3];
-                [enc setBuffer:B.bVol offset:0 atIndex:4];
-                [enc setBuffer:B.bXj offset:0 atIndex:5];
-                [enc setBuffer:dstOut offset:0 atIndex:6];
-                [enc setBytes:&Pp length:sizeof(Pp) atIndex:7];
-                dispatch1d(enc, pso, (NSUInteger)N);
-            };
-            id<MTLComputeCommandEncoder> e1 = [cmd computeCommandEncoder]; bind_pp(e1, ctx.psoDensity, B.density);   [e1 endEncoding];
-            id<MTLComputeCommandEncoder> e2 = [cmd computeCommandEncoder]; bind_pp(e2, ctx.psoFactor,  B.factorBuf); [e2 endEncoding];
-            id<MTLComputeCommandEncoder> e3 = [cmd computeCommandEncoder];
-            [e3 setBuffer:B.density offset:0 atIndex:0];
-            [e3 setBuffer:B.densAdv offset:0 atIndex:1];
-            [e3 setBytes:&Pp length:sizeof(Pp) atIndex:2];
-            dispatch1d(e3, ctx.psoDensadvClamp, (NSUInteger)N);
-            [e3 endEncoding];
+        // Fused build: CSR list + density + factor + clamped source, one traversal.
+        auto enc_build = [&](id<MTLCommandBuffer> cmd){
+            id<MTLComputeCommandEncoder> eb = [cmd computeCommandEncoder];
+            [eb setBuffer:B.sPoints offset:0 atIndex:0];
+            [eb setBuffer:B.sVol offset:0 atIndex:1];
+            [eb setBuffer:B.cellStart offset:0 atIndex:2];
+            [eb setBuffer:B.nlStart offset:0 atIndex:3];
+            [eb setBuffer:B.nlId offset:0 atIndex:4];
+            [eb setBuffer:B.nlVgw offset:0 atIndex:5];
+            [eb setBuffer:B.density offset:0 atIndex:6];
+            [eb setBuffer:B.factorBuf offset:0 atIndex:7];
+            [eb setBuffer:B.densAdv offset:0 atIndex:8];
+            [eb setBytes:&Pp length:sizeof(Pp) atIndex:9];
+            dispatch1d(eb, ctx.psoSphBuild, (NSUInteger)N);
+            [eb endEncoding];
         };
 
-        // optional XSPH: sweep into velSmooth (reads pre-smoothing vel), blit back into vel.
+        // optional XSPH from the CSR list (V_j*W precomputed in nlVgw.w): smooth into
+        // velSmooth (reads pre-smoothing vel), blit back into the caller's vel.
         auto enc_xsph = [&](id<MTLCommandBuffer> cmd){
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            [enc setBuffer:pts offset:0 atIndex:0];
-            [enc setBuffer:B.sPoints offset:0 atIndex:1];
-            [enc setBuffer:vol offset:0 atIndex:2];
-            [enc setBuffer:B.cellStart offset:0 atIndex:3];
-            [enc setBuffer:vel offset:0 atIndex:4];   // velIn
+            [enc setBuffer:B.nlStart offset:0 atIndex:0];
+            [enc setBuffer:B.nlId offset:0 atIndex:1];
+            [enc setBuffer:B.nlVgw offset:0 atIndex:2];
+            [enc setBuffer:B.sOrig offset:0 atIndex:3];
+            [enc setBuffer:vel offset:0 atIndex:4];   // velIn (caller order)
             [enc setBuffer:B.density offset:0 atIndex:5];
-            [enc setBuffer:B.velSmooth offset:0 atIndex:6];   // velOut
+            [enc setBuffer:B.velSmooth offset:0 atIndex:6];   // velOut (caller order)
             [enc setBytes:&Pp length:sizeof(Pp) atIndex:7];
-            dispatch1d(enc, ctx.psoXsph, (NSUInteger)N);
+            dispatch1d(enc, ctx.psoXsphNl, (NSUInteger)N);
             [enc endEncoding];
             id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
             [blit copyFromBuffer:B.velSmooth sourceOffset:0 toBuffer:vel destinationOffset:0
                             size:sizeof(float) * 3 * (size_t)N];
             [blit endEncoding];
-        };
-
-        // neighbour list (exact CSR): per-particle count -> GPU exclusive-scan into nlStart.
-        // The one-word total nlStart[N] is read after this command buffer to size nlId/nlVgw;
-        // the fill (enc_nlfill) then runs in the next command buffer.
-        auto enc_nlcount = [&](id<MTLCommandBuffer> cmd){
-            id<MTLComputeCommandEncoder> ec = [cmd computeCommandEncoder];
-            [ec setBuffer:pts offset:0 atIndex:0];
-            [ec setBuffer:B.sPoints offset:0 atIndex:1];
-            [ec setBuffer:B.cellStart offset:0 atIndex:2];
-            [ec setBuffer:B.count offset:0 atIndex:3];
-            [ec setBytes:&Pp length:sizeof(Pp) atIndex:4];
-            dispatch1d(ec, ctx.psoNlCount, (NSUInteger)N);
-            [ec endEncoding];
-            id<MTLComputeCommandEncoder> es = [cmd computeCommandEncoder];   // counts -> nlStart (exclusive)
-            [es setBuffer:B.count offset:0 atIndex:0];
-            [es setBuffer:B.nlStart offset:0 atIndex:1];
-            [es setBytes:&Pp length:sizeof(Pp) atIndex:2];
-            dispatch1d(es, ctx.psoExscan, 1);
-            [es endEncoding];
-        };
-        auto enc_nlfill = [&](id<MTLCommandBuffer> cmd){
-            id<MTLComputeCommandEncoder> ef = [cmd computeCommandEncoder];
-            [ef setBuffer:pts offset:0 atIndex:0];
-            [ef setBuffer:B.sPoints offset:0 atIndex:1];
-            [ef setBuffer:vol offset:0 atIndex:2];
-            [ef setBuffer:B.cellStart offset:0 atIndex:3];
-            [ef setBuffer:B.nlStart offset:0 atIndex:4];
-            [ef setBuffer:B.bVol offset:0 atIndex:5];
-            [ef setBuffer:B.bXj offset:0 atIndex:6];
-            [ef setBuffer:B.nlId offset:0 atIndex:7];
-            [ef setBuffer:B.nlVgw offset:0 atIndex:8];
-            [ef setBuffer:B.bVgw offset:0 atIndex:9];
-            [ef setBytes:&Pp length:sizeof(Pp) atIndex:10];
-            dispatch1d(ef, ctx.psoNlFill, (NSUInteger)N);
-            [ef endEncoding];
         };
 
         // CSR pressure-accel / Jacobi-update encoders (read nlStart[i]..nlStart[i+1]).
@@ -1890,14 +2065,15 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
                 id<MTLComputeCommandEncoder> eu = [cmd computeCommandEncoder]; enc_update(eu); [eu endEncoding];
             }
         };
-        // final accel from the converged p~, packed straight into the caller's float3 buffer.
+        // final accel from the converged p~, scattered into the caller's float3 buffer.
         auto enc_final = [&](id<MTLCommandBuffer> cmd){
             id<MTLComputeCommandEncoder> ea = [cmd computeCommandEncoder]; enc_accel(ea); [ea endEncoding];
             id<MTLComputeCommandEncoder> ecp = [cmd computeCommandEncoder];
             [ecp setBuffer:B.accel offset:0 atIndex:0];
-            [ecp setBuffer:out     offset:0 atIndex:1];
-            [ecp setBytes:&Ps length:sizeof(Ps) atIndex:2];
-            dispatch1d(ecp, ctx.psoAccelCopy3, (NSUInteger)N);
+            [ecp setBuffer:B.sOrig offset:0 atIndex:1];
+            [ecp setBuffer:out     offset:0 atIndex:2];
+            [ecp setBytes:&Ps length:sizeof(Ps) atIndex:3];
+            dispatch1d(ecp, ctx.psoAccelScatter3, (NSUInteger)N);
             [ecp endEncoding];
         };
 
@@ -1906,16 +2082,12 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         if (minIt > maxIt) minIt = maxIt;
         const bool earlyOut = (req.eta > 0.0f && minIt < maxIt);
 
-        // Size the exact CSR pair buffers from the neighbour-count scan. Shared by both
-        // paths: run CB1 (grid -> density/factor/clamp -> [XSPH] -> nl_count -> scan),
-        // wait once, then read the single word nlStart[N] (the pair total) and grow
-        // nlId/nlVgw to exactly that. CB1 has drained, so the realloc cannot race.
+        // CB1: grid -> scatter -> neighbour count -> scan. One wait, then read the
+        // single word nlStart[N] (the pair total) and grow nlId/nlVgw to exactly
+        // that. CB1 has drained, so the realloc cannot race.
         auto build_and_size_nl = [&]{
             id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
-            enc_grid(cmd);
-            enc_dfac(cmd);
-            if (doXsph) enc_xsph(cmd);
-            enc_nlcount(cmd);
+            enc_grid_count(cmd);
             [cmd commit];
             [cmd waitUntilCompleted];
             const uint32_t tot = ((const uint32_t*)B.nlStart.contents)[N];
@@ -1925,27 +2097,31 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         };
 
         if (!earlyOut) {
-            // Two command buffers, two waits: CB1 (grid..nl_count..scan) then, after the
-            // one-word size readback, CB2 = nl_fill -> all Jacobi iterations -> final pack.
+            // Two command buffers, two waits: CB1 sizes the CSR list; CB2 = fused
+            // build -> [XSPH] -> all Jacobi iterations -> final accel scatter.
             build_and_size_nl();
+            tBuild = pms(pt0, pnow());
             id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
-            enc_nlfill(cmd);
+            enc_build(cmd);
+            if (doXsph) enc_xsph(cmd);
             enc_jacobi(cmd, maxIt, /*zeroErr=*/false);
             enc_final(cmd);
             [cmd commit];
             [cmd waitUntilCompleted];
+            tSolve = pms(pt0, pnow()) - tBuild;
         } else {
             // Early-out requested: the convergence readback forces splitting the Jacobi
-            // loop. CB1 builds+sizes the list; the fill rides the first chunk's buffer;
-            // then chunked Jacobi (one wait per chunk) and the final accel pack.
+            // loop. CB1 sizes the list; the fused build (+XSPH) rides the first chunk's
+            // buffer; then chunked Jacobi (one wait per chunk) and the final scatter.
             build_and_size_nl();
+            tBuild = pms(pt0, pnow());
             const int kSolveChunk = 4;
             int done = 0;
             bool filled = false;
             while (done < maxIt) {
                 int g = (maxIt - done < kSolveChunk) ? (maxIt - done) : kSolveChunk;
                 id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
-                if (!filled) { enc_nlfill(cmd); filled = true; }
+                if (!filled) { enc_build(cmd); if (doXsph) enc_xsph(cmd); filled = true; }
                 enc_jacobi(cmd, g, /*zeroErr=*/true);
                 [cmd commit];
                 [cmd waitUntilCompleted];
@@ -1959,12 +2135,17 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
                 [cmd commit];
                 [cmd waitUntilCompleted];
             }
+            tSolve = pms(pt0, pnow()) - tBuild;
         }
 
-        // Leave no reusable cache behind: the resident grid/NL scratch is fluid-only and
-        // must not be picked up by a later host-pointer solve (which may add boundary).
+        // Leave no reusable cache behind: the resident grid/NL scratch is fluid-only,
+        // sorted-space, and must not be picked up by a later host-pointer solve.
         g_gridValid = false;
         g_nlValid   = false;
+    }
+    if (kProfile) {
+        std::fprintf(stderr, "[TNS_PROFILE] solve_gpu N=%d  build=%.2f solve=%.2f total=%.2f ms\n",
+                     N, tBuild, tSolve, tBuild + tSolve);
     }
     return true;
 }
