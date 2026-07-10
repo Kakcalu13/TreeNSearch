@@ -192,6 +192,15 @@ namespace internals
 		void* velocity = nullptr;   // float3/particle — IN/OUT: XSPH reads + writes it (null => no viscosity)
 		void* volume   = nullptr;   // float/particle = mass/density0 (rest-normalised density), particle order
 		void* outAccel = nullptr;   // float3/particle — pressure accel, written in place
+		void* pressure = nullptr;   // float/particle, particle order — IN/OUT warm start. In: the
+		                            // previous solve's converged p~/rho^2 as the Jacobi seed (standard
+		                            // DFSPH warm-starting; the seed can't change the fixed point, it
+		                            // only cuts iterations-to-converge — typically 2-3x on a slowly
+		                            // changing fluid, compounding with the eta early-out). Out: this
+		                            // solve's converged pressure, ready to seed the next call. Pass
+		                            // zeros on the first solve or whenever the particle order changed
+		                            // (the values are keyed by particle index). null => cold start
+		                            // from zero, bit-identical to the pre-warm-start behaviour.
 		int   n = 0;
 		float h = 0.0f;             // support radius (cell size = h)
 		float dt = 0.0f;            // substep timestep
@@ -203,14 +212,11 @@ namespace internals
 		float eta = 0.0f;           // avg density-error threshold; <=0 => run max_iterations
 		float viscosity = 0.0f;     // XSPH velocity-smoothing strength (~0.1-0.3); 0 => off.
 		                            // When >0 and velocity!=null, the solve smooths velocity in place.
-		int   max_neighbors = 0;    // cap on neighbours per particle; <=0 => exact CSR (no cap).
-		                            // Capping flattens the neighbour-density cost scaling of the
-		                            // Jacobi solve when the fluid transiently over-compresses (the
-		                            // truncated pocket under-estimates density slightly, which the
-		                            // pressure solve corrects toward anyway). The whole solve —
-		                            // density, factor, Jacobi, XSPH — runs consistently on the
-		                            // truncated list. ~2x the rest-packing count (e.g. 60 for
-		                            // h = 2*spacing, ~33 at rest) is a good cap.
+		int   max_neighbors = 0;    // <=0 (default) => exact CSR neighbour lists. A positive value
+		                            // truncates each particle's list at that count — this CHANGES THE
+		                            // PHYSICS (breaks pairwise symmetry, underestimates density) and
+		                            // exists only as an explicit opt-in; leave it at 0.
+		int*  iterations_out = nullptr;  // optional: receives the executed Jacobi iteration count
 	};
 	// Builds the grid, computes density + DFSPH factor, derives the constant-density
 	// source (relative density clamped >= 1, matching the host caller), runs the
@@ -218,7 +224,12 @@ namespace internals
 	// req.outAccel — all on the GPU, reading/writing the provided buffers. When
 	// req.viscosity > 0 and req.velocity != null, an XSPH velocity-smoothing pass also
 	// runs (after density) and writes the smoothed velocity back into req.velocity in
-	// place. Returns false (with `error` set) if Metal is unavailable or out of bounds.
+	// place. When req.pressure != null the Jacobi solve warm-starts from it and writes
+	// the converged pressure back (see the field doc). In steady state (the internal
+	// CSR cache holds 1.5x the previous solve's pair total) the whole solve is a
+	// single command buffer with a single CPU wait; a fluid whose pair density grew
+	// past the margin transparently re-runs that solve after growing the buffers.
+	// Returns false (with `error` set) if Metal is unavailable or out of bounds.
 	bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error);
 }
 }
