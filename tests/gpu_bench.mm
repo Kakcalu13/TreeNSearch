@@ -59,7 +59,7 @@ void make_block(int n, std::vector<float>& pts3, float& h, float& particleVolume
 struct BenchResult { double median_ms = 0, best_ms = 0; };
 
 BenchResult bench_solve(id<MTLDevice> dev, int n, int iters, int reps,
-                        float compress = 1.0f, int cap = 0)
+                        float compress = 1.0f)
 {
     using namespace tns::internals;
     std::vector<float> pts3; float h = 0, vol0 = 0;
@@ -85,7 +85,6 @@ BenchResult bench_solve(id<MTLDevice> dev, int n, int iters, int reps,
         req.grid_dims[d] = (int)std::floor((mx[d] - mn[d]) / h) + 1;
     }
     req.min_iterations = iters; req.max_iterations = iters; req.eta = 0.0f;   // fixed-count
-    req.max_neighbors = cap;   // 0 = exact CSR
 
     std::string err;
     if (!metal_sph_solve_gpu(req, err)) {   // warm-up (also sizes the buffer cache)
@@ -127,15 +126,13 @@ int main()
         }
 
         // The slosh-pocket regime: lattice compressed to 0.7 spacing (~3x the
-        // neighbour density, ~100/particle) — where the Jacobi cost blows up and
-        // the neighbour cap (max_neighbors) is meant to flatten it.
-        std::printf("\ncompressed block (x0.7 spacing, ~100 nbrs/particle), cap 0 vs 60\n");
-        std::printf("%10s %6s %6s %12s %12s\n", "N", "iters", "cap", "median(ms)", "best(ms)");
+        // neighbour density, ~100/particle) — exactly where the Jacobi cost used
+        // to blow up; exact CSR lists throughout.
+        std::printf("\ncompressed block (x0.7 spacing, ~100 nbrs/particle), exact lists\n");
+        std::printf("%10s %6s %12s %12s\n", "N", "iters", "median(ms)", "best(ms)");
         for (int n : {3000, 20000, 131072}) {
-            for (int cap : {0, 60}) {
-                auto r = bench_solve(dev, n, 14, 15, 0.7f, cap);
-                std::printf("%10d %6d %6d %12.3f %12.3f\n", n, 14, cap, r.median_ms, r.best_ms);
-            }
+            auto r = bench_solve(dev, n, 14, 15, 0.7f);
+            std::printf("%10d %6d %12.3f %12.3f\n", n, 14, r.median_ms, r.best_ms);
         }
     }
     return 0;
