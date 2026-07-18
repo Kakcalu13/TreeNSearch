@@ -47,6 +47,7 @@ struct Params {
                           // single-command-buffer fast path run before the pair total
                           // is known: writers/readers clamp to the allocation and the
                           // host retries the (rare) overflow after the wait.
+    float cohesion;       // Akinci cohesion (surface tension) strength, 0 = off
 };
 
 static inline int cell_index(float3 p, constant Params& P)
@@ -939,6 +940,54 @@ kernel void k_xsph_nl(device const uint*   nlStart    [[buffer(0)]],
     velOut[3*oi+0] = vs.x; velOut[3*oi+1] = vs.y; velOut[3*oi+2] = vs.z;
 }
 
+// Akinci cohesion (surface tension) from the CSR list:
+//   dv_i = -cohesion * dt * sum_j K_ij * m_j * C(r) * (x_i-x_j)/r
+// with m_j = V_j*density0, K_ij = 2/(rho_i+rho_j) (rest-normalised densities —
+// the Akinci inter-particle correction: under-dense surface particles pull
+// hardest, which is what rounds droplets and merges touching blobs), and C the
+// Akinci-Ihmsen-Teschner 2013 cohesion spline on the same support h as
+// everything else (attractive on (h/2, h], repulsive below h/2). The pair
+// distance comes from sortedPos, NOT from nlVgw — gradW's magnitude isn't
+// invertible near r=0. The kick is added straight into the caller's velocity
+// via sortedOrig (each thread owns one slot, so the in-place += is race-free);
+// encoded AFTER the XSPH blit so smoothing doesn't dilute the pull.
+kernel void k_cohesion_nl(device const uint*   nlStart    [[buffer(0)]],
+                          device const int*    nlId       [[buffer(1)]],
+                          device const float4* sortedPos  [[buffer(2)]],
+                          device const float*  sortedVol  [[buffer(3)]],
+                          device const float*  density    [[buffer(4)]],
+                          device const int*    sortedOrig [[buffer(5)]],
+                          device float*        vel        [[buffer(6)]],
+                          constant Params&     P          [[buffer(7)]],
+                          uint                 i          [[thread_position_in_grid]])
+{
+    if ((int)i >= P.nSearch) return;
+    const float h  = P.r2;
+    const float h2 = h * h;
+    const float h6 = h2 * h2 * h2;
+    const float kC = 32.0f / (3.14159265358979f * h6 * h * h * h);   // 32/(pi h^9)
+    float3 xi = sortedPos[i].xyz;
+    float  di = density[i];
+    const uint lim = (P.nlCap != 0u) ? P.nlCap : 0xFFFFFFFFu;
+    uint b = min(nlStart[i], lim), e = min(nlStart[i+1], lim);
+    float3 sum = float3(0.0f);
+    for (uint s = b; s < e; s++) {
+        int j = nlId[s];
+        float3 rvec = xi - sortedPos[j].xyz;
+        float r2 = dot(rvec, rvec);
+        if (r2 > h2 || r2 <= 1.0e-12f) continue;
+        float r = sqrt(r2);
+        float t = h - r;
+        float C = kC * (t * t * t) * (r * r * r);
+        if (r <= 0.5f * h) C = 2.0f * C - kC * h6 / 64.0f;
+        float Kij = 2.0f / max(di + density[j], 1.0e-6f);
+        sum += (Kij * sortedVol[j] * C / r) * rvec;
+    }
+    float3 dv = -P.cohesion * P.dt * P.density0 * sum;
+    int oi = sortedOrig[i];
+    vel[3*oi+0] += dv.x; vel[3*oi+1] += dv.y; vel[3*oi+2] += dv.z;
+}
+
 // Scatter the (sorted-order) pressure accel into the caller's tight float3 buffer.
 kernel void k_accel_scatter3(device const float4* accel      [[buffer(0)]],
                              device const int*    sortedOrig [[buffer(1)]],
@@ -1100,6 +1149,7 @@ struct MetalContext {
     id<MTLComputePipelineState> psoNlCountSorted = nil;
     id<MTLComputePipelineState> psoSphBuild     = nil;
     id<MTLComputePipelineState> psoXsphNl       = nil;
+    id<MTLComputePipelineState> psoCohesionNl   = nil;
     id<MTLComputePipelineState> psoAccelScatter3 = nil;
     id<MTLComputePipelineState> psoGatherF      = nil;
     id<MTLComputePipelineState> psoScatterF     = nil;
@@ -1183,6 +1233,7 @@ static void build_context(MetalContext& ctx, id<MTLDevice> dev, id<MTLCommandQue
         if (!make_pso("k_nl_count_sorted", ctx.psoNlCountSorted)) return;
         if (!make_pso("k_sph_build",       ctx.psoSphBuild))      return;
         if (!make_pso("k_xsph_nl",         ctx.psoXsphNl))        return;
+        if (!make_pso("k_cohesion_nl",     ctx.psoCohesionNl))    return;
         if (!make_pso("k_accel_scatter3",  ctx.psoAccelScatter3)) return;
         if (!make_pso("k_gather_f",        ctx.psoGatherF))       return;
         if (!make_pso("k_scatter_f",       ctx.psoScatterF))      return;
@@ -1226,6 +1277,7 @@ struct ParamsC {
     float viscosity;   // mirrors Params (MSL); XSPH strength, 0 = off
     int   maxNbr;      // mirrors Params (MSL); neighbour cap, <=0 = exact
     uint32_t nlCap;    // mirrors Params (MSL); CSR capacity in elements, 0 = unlimited
+    float cohesion;    // mirrors Params (MSL); cohesion strength, 0 = off
 };
 
 static void dispatch1d(id<MTLComputeCommandEncoder> enc,
@@ -1987,6 +2039,8 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         id<MTLBuffer> vel = req.velocity ? (__bridge id<MTLBuffer>)req.velocity : nil;
         id<MTLBuffer> press = req.pressure ? (__bridge id<MTLBuffer>)req.pressure : nil;
         const bool doXsph = (vel != nil && req.viscosity > 0.0f);
+        const bool doCohesion = (vel != nil && req.cohesion > 0.0f);
+        const bool touchesVel = doXsph || doCohesion;   // passes that modify req.velocity in place
 
         // ── Grid params, shared by every phase ───────────────────────────────────
         ParamsC P{};
@@ -1995,6 +2049,7 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         P.dx = req.grid_dims[0]; P.dy = req.grid_dims[1]; P.dz = req.grid_dims[2];
         P.R = 1; P.nCells = nCells; P.totalPoints = N; P.nSearch = N; P.r2 = req.h;
         P.maxNbr = req.max_neighbors;   // <=0 = exact CSR; >0 caps rows (see header)
+        P.cohesion = req.cohesion;
 
         // ── Scratch. Everything internal lives in SORTED (cell) order: the scatter
         //    reorders position + volume + original id, the fused build emits the CSR
@@ -2113,6 +2168,23 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
             [blit endEncoding];
         };
 
+        // Akinci cohesion kick from the CSR list, added in place to the caller's
+        // velocity (encoded after the XSPH blit; hazard tracking orders the two).
+        // Uses Ps for dt/density0.
+        auto enc_cohesion = [&](id<MTLCommandBuffer> cmd){
+            id<MTLComputeCommandEncoder> ec = [cmd computeCommandEncoder];
+            [ec setBuffer:B.nlStart offset:0 atIndex:0];
+            [ec setBuffer:B.nlId offset:0 atIndex:1];
+            [ec setBuffer:B.sPoints offset:0 atIndex:2];
+            [ec setBuffer:B.sVol offset:0 atIndex:3];
+            [ec setBuffer:B.density offset:0 atIndex:4];
+            [ec setBuffer:B.sOrig offset:0 atIndex:5];
+            [ec setBuffer:vel offset:0 atIndex:6];
+            [ec setBytes:&Ps length:sizeof(Ps) atIndex:7];
+            dispatch1d(ec, ctx.psoCohesionNl, (NSUInteger)N);
+            [ec endEncoding];
+        };
+
         // CSR pressure-accel / Jacobi-update encoders (read nlStart[i]..nlStart[i+1]).
         auto enc_accel = [&](id<MTLComputeCommandEncoder> enc){
             [enc setBuffer:B.nlStart offset:0 atIndex:0];
@@ -2203,9 +2275,9 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         //    total — read back after the solve's wait — exceeding the capacity means
         //    the fluid gained >50% pair density in one substep (a regime change):
         //    grow and redo from the fused build; the grid/scan results stay valid.
-        //    The redo re-seeds the pressure/err state, and XSPH smooths the caller's
-        //    velocity in place, so the fast path snapshots it up front and the redo
-        //    restores it — the retry then sees the exact original inputs. ──
+        //    The redo re-seeds the pressure/err state, and XSPH/cohesion modify the
+        //    caller's velocity in place, so the fast path snapshots it up front and
+        //    the redo restores it — the retry then sees the exact original inputs. ──
         const size_t capElems = B.nlId ? (B.nlId.length / sizeof(int)) : 0;
         const bool fastPath = B.nlLastTotal > 0 &&
                               capElems >= (size_t)B.nlLastTotal + (size_t)B.nlLastTotal / 2;
@@ -2227,12 +2299,13 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
             tBuild = pms(pt0, pnow());
         };
 
-        // Everything after the grid: fused build -> [XSPH] -> [warm-start gather]
-        // -> g Jacobi iterations.
+        // Everything after the grid: fused build -> [XSPH] -> [cohesion] ->
+        // [warm-start gather] -> g Jacobi iterations.
         auto enc_solve_head = [&](id<MTLCommandBuffer> cmd, int g, bool zeroErr){
             enc_build(cmd);
-            if (doXsph) enc_xsph(cmd);
-            if (press)  enc_gather(cmd);
+            if (doXsph)     enc_xsph(cmd);
+            if (doCohesion) enc_cohesion(cmd);
+            if (press)      enc_gather(cmd);
             enc_jacobi(cmd, g, zeroErr);
         };
         auto enc_vel_backup = [&](id<MTLCommandBuffer> cmd){
@@ -2251,7 +2324,7 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
             ensure(dev, B.nlId,  sizeof(int) * p);
             ensure(dev, B.nlVgw, sizeof(float) * 4 * p);
             Pp.nlCap = Ps.nlCap = (uint32_t)(B.nlId.length / sizeof(int));
-            if (doXsph) {
+            if (touchesVel) {
                 id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
                 id<MTLBlitCommandEncoder> bl = [cmd blitCommandEncoder];
                 [bl copyFromBuffer:B.velBackup sourceOffset:0 toBuffer:vel destinationOffset:0
@@ -2265,7 +2338,7 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
 
         if (fastPath) {
             Pp.nlCap = Ps.nlCap = (uint32_t)capElems;
-            if (doXsph) ensure(dev, B.velBackup, sizeof(float) * 3 * (size_t)N);
+            if (touchesVel) ensure(dev, B.velBackup, sizeof(float) * 3 * (size_t)N);
         }
 
         if (!earlyOut) {
@@ -2273,7 +2346,7 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
                 // ONE command buffer, ONE wait: grid + build + XSPH + all Jacobi
                 // iterations + final scatter (tBuild stays 0 — nothing to split).
                 id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
-                if (doXsph) enc_vel_backup(cmd);
+                if (touchesVel) enc_vel_backup(cmd);
                 enc_grid_count(cmd);
                 enc_solve_head(cmd, maxIt, /*zeroErr=*/false);
                 enc_final(cmd);
@@ -2323,7 +2396,7 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
             if (fastPath) {
                 int g = (maxIt < kSolveChunk) ? maxIt : kSolveChunk;
                 id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
-                if (doXsph) enc_vel_backup(cmd);
+                if (touchesVel) enc_vel_backup(cmd);
                 enc_grid_count(cmd);
                 enc_solve_head(cmd, g, /*zeroErr=*/true);
                 [cmd commit];
