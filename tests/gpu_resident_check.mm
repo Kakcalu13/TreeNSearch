@@ -371,6 +371,84 @@ int check_overflow_retry(id<MTLDevice> dev, id<MTLCommandQueue> queue, int n)
     return pass ? 0 : 1;
 }
 
+// Cohesion (Akinci surface tension): two isolated particles at rest, r = 0.9h
+// apart. With cohesion = 0 a solve must not touch the velocity at all (exact
+// zeros — pressure goes to outAccel, XSPH is off). With cohesion > 0 one solve
+// must kick the pair TOWARD each other (sign check on the x components), and
+// 100 solve+advect steps must stay finite (below h/2 the spline turns
+// repulsive, so the pair oscillates instead of collapsing).
+int check_cohesion(id<MTLDevice> dev, id<MTLCommandQueue> queue)
+{
+    using namespace tns::internals;
+    const int   n = 2;
+    const float h = 0.6f, dt = 0.0025f, density0 = 1000.0f;
+    std::string err;
+
+    metal_sph_set_external_context((__bridge void*)dev, (__bridge void*)queue);
+    id<MTLBuffer> pBuf   = [dev newBufferWithLength:sizeof(float) * 4 * n options:MTLResourceStorageModeShared];
+    id<MTLBuffer> vBuf   = [dev newBufferWithLength:sizeof(float) * n     options:MTLResourceStorageModeShared];
+    id<MTLBuffer> velBuf = [dev newBufferWithLength:sizeof(float) * 3 * n options:MTLResourceStorageModeShared];
+    id<MTLBuffer> aBuf   = [dev newBufferWithLength:sizeof(float) * 3 * n options:MTLResourceStorageModeShared];
+    float* p4 = (float*)pBuf.contents;
+    std::memset(p4, 0, sizeof(float) * 4 * n);
+    p4[0*4+3] = 1.0f;
+    p4[1*4+0] = 0.9f * h; p4[1*4+3] = 1.0f;
+    float* vv = (float*)vBuf.contents;
+    vv[0] = vv[1] = 0.02f;
+
+    auto solve = [&](float cohesion) -> bool {
+        float mn[3] = { 1e30f,  1e30f,  1e30f};
+        float mx[3] = {-1e30f, -1e30f, -1e30f};
+        for (int i = 0; i < n; i++)
+            for (int d = 0; d < 3; d++) { float v = p4[4*i+d]; mn[d] = std::min(mn[d], v); mx[d] = std::max(mx[d], v); }
+        MetalSphGpuRequest req;
+        req.points   = (__bridge void*)pBuf;
+        req.volume   = (__bridge void*)vBuf;
+        req.velocity = (__bridge void*)velBuf;
+        req.outAccel = (__bridge void*)aBuf;
+        req.n = n; req.h = h; req.dt = dt; req.density0 = density0;
+        req.cohesion = cohesion;
+        for (int d = 0; d < 3; d++) {
+            req.origin[d] = mn[d];
+            req.grid_dims[d] = (int)std::floor((mx[d] - mn[d]) / h) + 1;
+        }
+        req.min_iterations = 2; req.max_iterations = 2; req.eta = 0.0f;
+        return metal_sph_solve_gpu(req, err);
+    };
+
+    // cohesion = 0: velocity must come back exactly untouched.
+    std::memset(velBuf.contents, 0, sizeof(float) * 3 * n);
+    if (!solve(0.0f)) { std::printf("  cohesion: zero-gamma solve FAILED: %s\n", err.c_str()); metal_sph_invalidate_grid(); return 1; }
+    const float* v = (const float*)velBuf.contents;
+    bool zeroOk = true;
+    for (int i = 0; i < 3 * n; i++) zeroOk = zeroOk && (v[i] == 0.0f);
+
+    // cohesion > 0: one solve from rest must pull the pair together.
+    if (!solve(0.5f)) { std::printf("  cohesion: solve FAILED: %s\n", err.c_str()); metal_sph_invalidate_grid(); return 1; }
+    const bool toward = (v[0] > 0.0f) && (v[3] < 0.0f);
+    const float kick = v[0];
+
+    // 100 steps of solve + advect: everything stays finite.
+    int bad = 0;
+    for (int s = 0; s < 100 && bad == 0; s++) {
+        if (!solve(0.5f)) { bad = 1; break; }
+        for (int i = 0; i < n && bad == 0; i++)
+            for (int d = 0; d < 3; d++) {
+                if (!std::isfinite(v[3*i+d])) { bad = 1; break; }
+                p4[4*i+d] += v[3*i+d] * dt;
+                if (!std::isfinite(p4[4*i+d])) { bad = 1; break; }
+            }
+    }
+
+    const bool pass = zeroOk && toward && (bad == 0);
+    std::printf("  cohesion 2-body r=0.9h: gamma=0 vel untouched %s, kick toward %s (dv_x %.3e), "
+                "100 steps finite %s ... %s\n",
+                zeroOk ? "yes" : "NO", toward ? "yes" : "NO", (double)kick,
+                bad == 0 ? "yes" : "NO", pass ? "passed!" : "FAILED!");
+    metal_sph_invalidate_grid();
+    return pass ? 0 : 1;
+}
+
 // CubicKernel W (matches k_density / SPlisHSPlasH SPHKernels.h).
 double cubicW(double r, double h)
 {
@@ -476,6 +554,7 @@ int run_resident_checks()
         fails += check_resident(dev, queue, 20000);
         fails += check_warmstart(dev, queue, 3000);
         fails += check_overflow_retry(dev, queue, 3000);
+        fails += check_cohesion(dev, queue);
         fails += check_xsph(dev, queue, 3000);
         return fails;
     }
