@@ -59,7 +59,7 @@ void make_block(int n, std::vector<float>& pts3, float& h, float& particleVolume
 struct BenchResult { double median_ms = 0, best_ms = 0; };
 
 BenchResult bench_solve(id<MTLDevice> dev, int n, int iters, int reps,
-                        float compress = 1.0f)
+                        float compress = 1.0f, float cohesion = 0.0f)
 {
     using namespace tns::internals;
     std::vector<float> pts3; float h = 0, vol0 = 0;
@@ -77,8 +77,16 @@ BenchResult bench_solve(id<MTLDevice> dev, int n, int iters, int reps,
     float* vv = (float*)vBuf.contents;
     for (int i = 0; i < n; i++) vv[i] = vol0;
 
+    id<MTLBuffer> velBuf = nil;
+    if (cohesion > 0.0f) {   // the cohesion pass needs a velocity buffer to kick
+        velBuf = [dev newBufferWithLength:sizeof(float) * 3 * n options:MTLResourceStorageModeShared];
+        std::memset(velBuf.contents, 0, sizeof(float) * 3 * (size_t)n);
+    }
+
     MetalSphGpuRequest req;
     req.points = (__bridge void*)pBuf; req.volume = (__bridge void*)vBuf; req.outAccel = (__bridge void*)aBuf;
+    req.velocity = (__bridge void*)velBuf;
+    req.cohesion = cohesion;
     req.n = n; req.h = h; req.dt = 0.0025f; req.density0 = 1000.0f;
     for (int d = 0; d < 3; d++) {
         req.origin[d] = mn[d];
@@ -133,6 +141,18 @@ int main()
         for (int n : {3000, 20000, 131072}) {
             auto r = bench_solve(dev, n, 14, 15, 0.7f);
             std::printf("%10d %6d %12.3f %12.3f\n", n, 14, r.median_ms, r.best_ms);
+        }
+
+        // Cohesion pass cost: one extra dispatch over the CSR list (plus the
+        // fast path's velocity snapshot blit) — expect it in the noise next to
+        // a single Jacobi iteration.
+        std::printf("\ncohesion pass (compressed block, 14 it): gamma 0 vs 0.5\n");
+        std::printf("%10s %6s %8s %12s %12s\n", "N", "iters", "gamma", "median(ms)", "best(ms)");
+        for (int n : {20000, 131072}) {
+            for (float g : {0.0f, 0.5f}) {
+                auto r = bench_solve(dev, n, 14, 15, 0.7f, g);
+                std::printf("%10d %6d %8.1f %12.3f %12.3f\n", n, 14, (double)g, r.median_ms, r.best_ms);
+            }
         }
     }
     return 0;
