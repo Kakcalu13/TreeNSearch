@@ -212,6 +212,16 @@ namespace internals
 		float eta = 0.0f;           // avg density-error threshold; <=0 => run max_iterations
 		float viscosity = 0.0f;     // XSPH velocity-smoothing strength (~0.1-0.3); 0 => off.
 		                            // When >0 and velocity!=null, the solve smooths velocity in place.
+		float cohesion = 0.0f;      // Akinci-style surface-tension (cohesion) strength gamma; 0 =>
+		                            // pass skipped, bit-identical to before. When >0 and
+		                            // velocity!=null, one pass over the CSR list adds
+		                            //   dv_i = -gamma*dt * sum_j 2/(rho_i+rho_j) * (V_j*density0)
+		                            //          * C(|x_ij|) * x_ij/|x_ij|
+		                            // (C = the Akinci-Ihmsen-Teschner 2013 cohesion spline, support
+		                            // h; rho = rest-normalised density) into req.velocity in place,
+		                            // AFTER the XSPH smoothing so smoothing doesn't dilute the pull.
+		                            // The pairwise pull is what merges adjacent blobs/droplets;
+		                            // below h/2 the spline turns repulsive, so pairs don't collapse.
 		int   max_neighbors = 0;    // <=0 (default) => exact CSR neighbour lists. A positive value
 		                            // truncates each particle's list at that count — this CHANGES THE
 		                            // PHYSICS (breaks pairwise symmetry, underestimates density) and
@@ -224,7 +234,8 @@ namespace internals
 	// req.outAccel — all on the GPU, reading/writing the provided buffers. When
 	// req.viscosity > 0 and req.velocity != null, an XSPH velocity-smoothing pass also
 	// runs (after density) and writes the smoothed velocity back into req.velocity in
-	// place. When req.pressure != null the Jacobi solve warm-starts from it and writes
+	// place; req.cohesion > 0 then adds the surface-tension kick (see the field doc).
+	// When req.pressure != null the Jacobi solve warm-starts from it and writes
 	// the converged pressure back (see the field doc). In steady state (the internal
 	// CSR cache holds 1.5x the previous solve's pair total) the whole solve is a
 	// single command buffer with a single CPU wait; a fluid whose pair density grew
