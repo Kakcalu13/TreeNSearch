@@ -43,6 +43,11 @@ struct Params {
     int   divergence;     // 1 -> divergence mode (s_i=-densityAdv, deficiency cutoff)
     float viscosity;      // XSPH velocity-smoothing strength (0 = off)
     int   maxNbr;         // neighbour cap per particle (resident solve); <=0 = exact
+    uint  nlCap;          // CSR buffer capacity in elements; 0 = unlimited. Lets the
+                          // single-command-buffer fast path run before the pair total
+                          // is known: writers/readers clamp to the allocation and the
+                          // host retries the (rare) overflow after the wait.
+    float cohesion;       // Akinci cohesion (surface tension) strength, 0 = off
 };
 
 static inline int cell_index(float3 p, constant Params& P)
@@ -610,6 +615,16 @@ kernel void k_nl_fill(device const float4* points    [[buffer(0)]],
     }
 }
 
+// ── Jacobi kernels: one 32-lane simdgroup per particle ────────────────────────
+// One thread walking a whole CSR row serially is exactly what blows up when the
+// fluid compresses (row length is the thing that grows), and at engine scale
+// (~2.4k particles) an N-thread dispatch also under-occupies the GPU. Instead,
+// dispatch N*32 threads: lanes stride the row, partial sums reduce with
+// simd_sum, lane 0 writes. Neighbour count becomes parallel width, not serial
+// depth — on exact lists. Dispatched via dispatch_rows_simd (total threads are
+// a multiple of 32, so every simdgroup is fully populated and simd_sum sees
+// uniform control flow).
+
 // Pressure accel from the neighbour list: a_i = -sum (p~_i+p~_j) Vgw - p~_i bVgw.
 kernel void k_pa_nl(device const uint*   nlStart [[buffer(0)]],
                     device const int*    nlId    [[buffer(1)]],
@@ -618,13 +633,18 @@ kernel void k_pa_nl(device const uint*   nlStart [[buffer(0)]],
                     device const float*  pRho2   [[buffer(4)]],
                     device float4*       accel   [[buffer(5)]],
                     constant Params&     P       [[buffer(6)]],
-                    uint                 i       [[thread_position_in_grid]])
+                    uint                 tid     [[thread_position_in_grid]],
+                    uint                 lane    [[thread_index_in_simdgroup]])
 {
+    const uint i = tid / 32u;
     if ((int)i >= P.nSearch) return;
+    const uint lim = (P.nlCap != 0u) ? P.nlCap : 0xFFFFFFFFu;
     float pri = pRho2[i];
     float3 a = float3(0.0f);
-    uint b = nlStart[i], e = nlStart[i+1];
-    for (uint s = b; s < e; s++) a -= nlVgw[s].xyz * (pri + pRho2[nlId[s]]);
+    uint b = min(nlStart[i], lim), e = min(nlStart[i+1], lim);
+    for (uint s = b + lane; s < e; s += 32u) a -= nlVgw[s].xyz * (pri + pRho2[nlId[s]]);
+    a.x = simd_sum(a.x); a.y = simd_sum(a.y); a.z = simd_sum(a.z);
+    if (lane != 0u) return;
     if (P.hasBoundary != 0) a -= pri * bVgw[i].xyz;
     accel[i] = float4(a, 0.0f);
 }
@@ -640,13 +660,18 @@ kernel void k_pu_nl(device const uint*   nlStart [[buffer(0)]],
                     device float*        pRho2   [[buffer(7)]],
                     device atomic_float* errSum  [[buffer(8)]],
                     constant Params&     P       [[buffer(9)]],
-                    uint                 i       [[thread_position_in_grid]])
+                    uint                 tid     [[thread_position_in_grid]],
+                    uint                 lane    [[thread_index_in_simdgroup]])
 {
+    const uint i = tid / 32u;
     if ((int)i >= P.nSearch) return;
+    const uint lim = (P.nlCap != 0u) ? P.nlCap : 0xFFFFFFFFu;
     float3 ai = accel[i].xyz;
-    uint b = nlStart[i], e = nlStart[i+1];
+    uint b = min(nlStart[i], lim), e = min(nlStart[i+1], lim);
     float aij = 0.0f;
-    for (uint s = b; s < e; s++) aij += dot(ai - accel[nlId[s]].xyz, nlVgw[s].xyz);
+    for (uint s = b + lane; s < e; s += 32u) aij += dot(ai - accel[nlId[s]].xyz, nlVgw[s].xyz);
+    aij = simd_sum(aij);
+    if (lane != 0u) return;
     if (P.hasBoundary != 0) aij += dot(ai, bVgw[i].xyz);
     aij *= P.aij_scale;
     float s_i = (P.divergence != 0) ? (-densAdv[i]) : (1.0f - densAdv[i]);
@@ -814,7 +839,10 @@ kernel void k_nl_count_sorted(device const float4* sortedPos [[buffer(0)]],
 // The traversal stops when the CSR row is full (k == nlStart[i+1]). Uncapped
 // that changes nothing (the row is exactly the neighbour count); with a capped
 // count it truncates density/factor/source along with the list, so the solve
-// stays self-consistent on the truncated neighbourhood.
+// stays self-consistent on the truncated neighbourhood. The row end is further
+// clamped to P.nlCap (buffer capacity) so the single-command-buffer fast path
+// can never write past the allocation — an overflowed solve is detected and
+// re-run by the host (see metal_sph_solve_gpu).
 kernel void k_sph_build(device const float4* sortedPos  [[buffer(0)]],
                         device const float*  sortedVol  [[buffer(1)]],
                         device const uint*   cellStart  [[buffer(2)]],
@@ -842,8 +870,9 @@ kernel void k_sph_build(device const float4* sortedPos  [[buffer(0)]],
     int cy = clamp((int)floor((xi.y - P.oy) * P.inv_cs), 0, P.dy - 1);
     int cz = clamp((int)floor((xi.z - P.oz) * P.inv_cs), 0, P.dz - 1);
     int xlo = max(cx - 1, 0), xhi = min(cx + 1, P.dx - 1);
+    const uint lim = (P.nlCap != 0u) ? P.nlCap : 0xFFFFFFFFu;
     uint k = nlStart[i];
-    const uint kend = nlStart[i + 1];
+    const uint kend = min(nlStart[i + 1], lim);
     for (int dz = -1; dz <= 1 && k < kend; dz++) { int ncz = cz + dz; if (ncz < 0 || ncz >= P.dz) continue;
     for (int dy = -1; dy <= 1 && k < kend; dy++) { int ncy = cy + dy; if (ncy < 0 || ncy >= P.dy) continue;
         int row = (ncz * P.dy + ncy) * P.dx;
@@ -899,7 +928,8 @@ kernel void k_xsph_nl(device const uint*   nlStart    [[buffer(0)]],
     int oi = sortedOrig[i];
     float3 vi = float3(velIn[3*oi+0], velIn[3*oi+1], velIn[3*oi+2]);
     float3 acc = float3(0.0f);
-    uint b = nlStart[i], e = nlStart[i+1];
+    const uint lim = (P.nlCap != 0u) ? P.nlCap : 0xFFFFFFFFu;
+    uint b = min(nlStart[i], lim), e = min(nlStart[i+1], lim);
     for (uint s = b; s < e; s++) {
         int oj = sortedOrig[nlId[s]];
         float3 vj = float3(velIn[3*oj+0], velIn[3*oj+1], velIn[3*oj+2]);
@@ -908,6 +938,54 @@ kernel void k_xsph_nl(device const uint*   nlStart    [[buffer(0)]],
     float di = max(density[i], 1.0e-6f);
     float3 vs = vi + P.viscosity * acc / di;
     velOut[3*oi+0] = vs.x; velOut[3*oi+1] = vs.y; velOut[3*oi+2] = vs.z;
+}
+
+// Akinci cohesion (surface tension) from the CSR list:
+//   dv_i = -cohesion * dt * sum_j K_ij * m_j * C(r) * (x_i-x_j)/r
+// with m_j = V_j*density0, K_ij = 2/(rho_i+rho_j) (rest-normalised densities —
+// the Akinci inter-particle correction: under-dense surface particles pull
+// hardest, which is what rounds droplets and merges touching blobs), and C the
+// Akinci-Ihmsen-Teschner 2013 cohesion spline on the same support h as
+// everything else (attractive on (h/2, h], repulsive below h/2). The pair
+// distance comes from sortedPos, NOT from nlVgw — gradW's magnitude isn't
+// invertible near r=0. The kick is added straight into the caller's velocity
+// via sortedOrig (each thread owns one slot, so the in-place += is race-free);
+// encoded AFTER the XSPH blit so smoothing doesn't dilute the pull.
+kernel void k_cohesion_nl(device const uint*   nlStart    [[buffer(0)]],
+                          device const int*    nlId       [[buffer(1)]],
+                          device const float4* sortedPos  [[buffer(2)]],
+                          device const float*  sortedVol  [[buffer(3)]],
+                          device const float*  density    [[buffer(4)]],
+                          device const int*    sortedOrig [[buffer(5)]],
+                          device float*        vel        [[buffer(6)]],
+                          constant Params&     P          [[buffer(7)]],
+                          uint                 i          [[thread_position_in_grid]])
+{
+    if ((int)i >= P.nSearch) return;
+    const float h  = P.r2;
+    const float h2 = h * h;
+    const float h6 = h2 * h2 * h2;
+    const float kC = 32.0f / (3.14159265358979f * h6 * h * h * h);   // 32/(pi h^9)
+    float3 xi = sortedPos[i].xyz;
+    float  di = density[i];
+    const uint lim = (P.nlCap != 0u) ? P.nlCap : 0xFFFFFFFFu;
+    uint b = min(nlStart[i], lim), e = min(nlStart[i+1], lim);
+    float3 sum = float3(0.0f);
+    for (uint s = b; s < e; s++) {
+        int j = nlId[s];
+        float3 rvec = xi - sortedPos[j].xyz;
+        float r2 = dot(rvec, rvec);
+        if (r2 > h2 || r2 <= 1.0e-12f) continue;
+        float r = sqrt(r2);
+        float t = h - r;
+        float C = kC * (t * t * t) * (r * r * r);
+        if (r <= 0.5f * h) C = 2.0f * C - kC * h6 / 64.0f;
+        float Kij = 2.0f / max(di + density[j], 1.0e-6f);
+        sum += (Kij * sortedVol[j] * C / r) * rvec;
+    }
+    float3 dv = -P.cohesion * P.dt * P.density0 * sum;
+    int oi = sortedOrig[i];
+    vel[3*oi+0] += dv.x; vel[3*oi+1] += dv.y; vel[3*oi+2] += dv.z;
 }
 
 // Scatter the (sorted-order) pressure accel into the caller's tight float3 buffer.
@@ -921,6 +999,32 @@ kernel void k_accel_scatter3(device const float4* accel      [[buffer(0)]],
     int oi = sortedOrig[i];
     float3 a = accel[i].xyz;
     out3[3*oi+0] = a.x; out3[3*oi+1] = a.y; out3[3*oi+2] = a.z;
+}
+
+// Pressure warm-start plumbing: the caller's persistent pressure lives in
+// caller (original) order, the Jacobi state in sorted order. Gather seeds
+// pRho2 from the previous solve's converged pressure; scatter writes the new
+// converged pressure back. A seed doesn't change the Jacobi fixed point — it
+// only cuts the iterations needed to reach it.
+kernel void k_gather_f(device const float* in         [[buffer(0)]],   // caller order
+                       device const int*   sortedOrig [[buffer(1)]],
+                       device float*       out        [[buffer(2)]],   // sorted order
+                       constant Params&    P          [[buffer(3)]],
+                       uint                i          [[thread_position_in_grid]])
+{
+    if ((int)i >= P.nSearch) return;
+    float v = in[sortedOrig[i]];
+    out[i] = isfinite(v) ? max(v, 0.0f) : 0.0f;   // p~/rho^2 is non-negative by construction
+}
+
+kernel void k_scatter_f(device const float* in         [[buffer(0)]],   // sorted order
+                        device const int*   sortedOrig [[buffer(1)]],
+                        device float*       out        [[buffer(2)]],   // caller order
+                        constant Params&    P          [[buffer(3)]],
+                        uint                i          [[thread_position_in_grid]])
+{
+    if ((int)i >= P.nSearch) return;
+    out[sortedOrig[i]] = in[i];
 }
 
 // ─── Sorted-order fast search (uniform radius, single set) ────────────────────
@@ -1045,7 +1149,10 @@ struct MetalContext {
     id<MTLComputePipelineState> psoNlCountSorted = nil;
     id<MTLComputePipelineState> psoSphBuild     = nil;
     id<MTLComputePipelineState> psoXsphNl       = nil;
+    id<MTLComputePipelineState> psoCohesionNl   = nil;
     id<MTLComputePipelineState> psoAccelScatter3 = nil;
+    id<MTLComputePipelineState> psoGatherF      = nil;
+    id<MTLComputePipelineState> psoScatterF     = nil;
     id<MTLComputePipelineState> psoSearchFastSorted  = nil;
     id<MTLComputePipelineState> psoCompactFastSorted = nil;
     bool ok = false;
@@ -1126,7 +1233,10 @@ static void build_context(MetalContext& ctx, id<MTLDevice> dev, id<MTLCommandQue
         if (!make_pso("k_nl_count_sorted", ctx.psoNlCountSorted)) return;
         if (!make_pso("k_sph_build",       ctx.psoSphBuild))      return;
         if (!make_pso("k_xsph_nl",         ctx.psoXsphNl))        return;
+        if (!make_pso("k_cohesion_nl",     ctx.psoCohesionNl))    return;
         if (!make_pso("k_accel_scatter3",  ctx.psoAccelScatter3)) return;
+        if (!make_pso("k_gather_f",        ctx.psoGatherF))       return;
+        if (!make_pso("k_scatter_f",       ctx.psoScatterF))      return;
         if (!make_pso("k_search_fast_sorted",  ctx.psoSearchFastSorted))  return;
         if (!make_pso("k_compact_fast_sorted", ctx.psoCompactFastSorted)) return;
 
@@ -1166,6 +1276,8 @@ struct ParamsC {
     int   divergence;
     float viscosity;   // mirrors Params (MSL); XSPH strength, 0 = off
     int   maxNbr;      // mirrors Params (MSL); neighbour cap, <=0 = exact
+    uint32_t nlCap;    // mirrors Params (MSL); CSR capacity in elements, 0 = unlimited
+    float cohesion;    // mirrors Params (MSL); cohesion strength, 0 = off
 };
 
 static void dispatch1d(id<MTLComputeCommandEncoder> enc,
@@ -1181,6 +1293,21 @@ static void dispatch1d(id<MTLComputeCommandEncoder> enc,
         threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 }
 
+// One 32-lane simdgroup per CSR row (k_pa_nl / k_pu_nl): rows*32 threads, lanes
+// stride the row. Total threads are a multiple of 32 and the threadgroup width
+// is too, so no simdgroup straddles the grid edge — simd_sum stays uniform.
+static void dispatch_rows_simd(id<MTLComputeCommandEncoder> enc,
+                               id<MTLComputePipelineState> pso, NSUInteger rows)
+{
+    NSUInteger tpg = pso.maxTotalThreadsPerThreadgroup;
+    if (tpg > 256) tpg = 256;
+    tpg &= ~(NSUInteger)31;
+    if (tpg == 0) tpg = 32;
+    [enc setComputePipelineState:pso];
+    [enc dispatchThreads:MTLSizeMake(rows * 32, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+}
+
 // ── Persistent, grow-only GPU buffer cache ───────────────────────────────────
 // Reused across calls so the SPH loop (same point sets every step) does not
 // reallocate Metal buffers each frame. Not thread-safe: assumes one search at a
@@ -1191,9 +1318,12 @@ struct GpuBuffers {
     id<MTLBuffer> count, scratch;
     id<MTLBuffer> volume, density, bVol, bXj, velocity;
     id<MTLBuffer> velSmooth;                   // XSPH double-buffer (velOut)
+    id<MTLBuffer> velBackup;                   // pre-solve velocity copy (overflow retry)
     id<MTLBuffer> pRho2, accel, densAdv, factorBuf, err;
     id<MTLBuffer> nlStart, nlId, nlVgw, bVgw;   // precomputed neighbour list for the solve
     id<MTLBuffer> sVol, blockSums;              // sorted volume + parallel-scan scratch
+    uint32_t nlLastTotal = 0;                   // pair total of the last resident solve
+                                                // (sizes the single-CB fast-path margin)
     // Zero-copy neighbour-search results: one packed-block + offsets buffer per
     // search pair, handed to the caller as pointers into unified memory (valid
     // until the next metal_neighbor_search call in the process).
@@ -1819,7 +1949,7 @@ bool metal_pressure_solve(const MetalPressureRequest& req, float* out_accel, int
             [enc setBuffer:B.pRho2   offset:0 atIndex:4];
             [enc setBuffer:B.accel   offset:0 atIndex:5];
             [enc setBytes:&P length:sizeof(P) atIndex:6];
-            dispatch1d(enc, ctx.psoPaNl, (NSUInteger)N);
+            dispatch_rows_simd(enc, ctx.psoPaNl, (NSUInteger)N);
         };
         auto encode_update = [&](id<MTLComputeCommandEncoder> enc){
             [enc setBuffer:B.nlStart   offset:0 atIndex:0];
@@ -1832,7 +1962,7 @@ bool metal_pressure_solve(const MetalPressureRequest& req, float* out_accel, int
             [enc setBuffer:B.pRho2     offset:0 atIndex:7];
             [enc setBuffer:B.err       offset:0 atIndex:8];
             [enc setBytes:&P length:sizeof(P) atIndex:9];
-            dispatch1d(enc, ctx.psoPuNl, (NSUInteger)N);
+            dispatch_rows_simd(enc, ctx.psoPuNl, (NSUInteger)N);
         };
         // One iteration = accel + update in a single command buffer (one CPU<->GPU
         // sync), with the density error reduced on the GPU into B.err[0].
@@ -1907,7 +2037,10 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         id<MTLBuffer> vol = (__bridge id<MTLBuffer>)req.volume;
         id<MTLBuffer> out = (__bridge id<MTLBuffer>)req.outAccel;
         id<MTLBuffer> vel = req.velocity ? (__bridge id<MTLBuffer>)req.velocity : nil;
+        id<MTLBuffer> press = req.pressure ? (__bridge id<MTLBuffer>)req.pressure : nil;
         const bool doXsph = (vel != nil && req.viscosity > 0.0f);
+        const bool doCohesion = (vel != nil && req.cohesion > 0.0f);
+        const bool touchesVel = doXsph || doCohesion;   // passes that modify req.velocity in place
 
         // ── Grid params, shared by every phase ───────────────────────────────────
         ParamsC P{};
@@ -1916,16 +2049,18 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         P.dx = req.grid_dims[0]; P.dy = req.grid_dims[1]; P.dz = req.grid_dims[2];
         P.R = 1; P.nCells = nCells; P.totalPoints = N; P.nSearch = N; P.r2 = req.h;
         P.maxNbr = req.max_neighbors;   // <=0 = exact CSR; >0 caps rows (see header)
+        P.cohesion = req.cohesion;
 
         // ── Scratch. Everything internal lives in SORTED (cell) order: the scatter
         //    reorders position + volume + original id, the fused build emits the CSR
         //    list, density, factor and the clamped source in ONE traversal, and the
         //    Jacobi state (pRho2 / accel / densAdv / factor) is indexed by sorted slot
         //    so neighbour gathers stay cache-local. Both prefix-sums are parallel GPU
-        //    scans. The only host dependency is the one-word pair total nlStart[N],
-        //    read back to size nlId/nlVgw (exact CSR by default; req.max_neighbors
-        //    caps rows at the count) — hence two command buffers / two waits.
-        //    Results are scattered to caller order at the end. ──
+        //    scans. The only host dependency is the one-word pair total nlStart[N]
+        //    that sizes nlId/nlVgw (exact CSR); once the grow-only cache holds
+        //    1.5x the previous solve's total that readback is skipped and the whole
+        //    solve rides ONE command buffer (fast path below). Results are
+        //    scattered to caller order at the end. ──
         ensure(dev, B.cellId,     sizeof(uint32_t) * (size_t)N);
         ensure(dev, B.counts,     sizeof(uint32_t) * (size_t)nCells);
         ensure(dev, B.cellStart,  sizeof(uint32_t) * (size_t)(nCells + 1));
@@ -1944,11 +2079,12 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         ensure(dev, B.bVgw,       sizeof(float) * 4);   // bound but unread (no boundary)
         if (doXsph) ensure(dev, B.velSmooth, sizeof(float) * 3 * (size_t)N);
 
-        // Host-side buffer prep. These writes precede [cmd commit], so the GPU sees them
-        // (shared storage): zero the per-cell counts (hash accumulates), the pressure
-        // (starts at rest) and the density-error accumulator (atomic reduction target).
-        std::memset(B.counts.contents, 0, sizeof(uint32_t) * (size_t)nCells);
-        std::memset(B.pRho2.contents,  0, sizeof(float) * (size_t)N);
+        // Host-side buffer prep. These writes precede [cmd commit], so the GPU sees
+        // them (shared storage): zero the pressure seed (rest start — unless the
+        // caller passed a warm-start buffer, which is gathered on-GPU instead) and
+        // the density-error accumulator. The per-cell counts are zeroed on-GPU by a
+        // fillBuffer blit at the head of the grid encoding.
+        if (!press) std::memset(B.pRho2.contents, 0, sizeof(float) * (size_t)N);
         *(float*)B.err.contents = 0.0f;
 
         ParamsC Pp = P; Pp.hasBoundary = 0; Pp.viscosity = req.viscosity;   // grid + fused build
@@ -1959,9 +2095,13 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
         //    Metal serialises compute encoders within one buffer and auto-tracks buffer
         //    hazards between them, so back-to-back phases need no CPU sync. ──────────────
 
-        // grid: hash (counts pre-zeroed) -> parallel scan -> scatter pos/vol/orig into
-        // cell order; then per-slot neighbour count -> parallel scan into nlStart.
+        // grid: zero counts (on-GPU fill) -> hash -> parallel scan -> scatter
+        // pos/vol/orig into cell order; then per-slot neighbour count -> parallel
+        // scan into nlStart.
         auto enc_grid_count = [&](id<MTLCommandBuffer> cmd){
+            id<MTLBlitCommandEncoder> bz = [cmd blitCommandEncoder];
+            [bz fillBuffer:B.counts range:NSMakeRange(0, sizeof(uint32_t) * (size_t)nCells) value:0];
+            [bz endEncoding];
             id<MTLComputeCommandEncoder> eh = [cmd computeCommandEncoder];
             [eh setBuffer:pts offset:0 atIndex:0];
             [eh setBuffer:B.cellId offset:0 atIndex:1];
@@ -2028,6 +2168,23 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
             [blit endEncoding];
         };
 
+        // Akinci cohesion kick from the CSR list, added in place to the caller's
+        // velocity (encoded after the XSPH blit; hazard tracking orders the two).
+        // Uses Ps for dt/density0.
+        auto enc_cohesion = [&](id<MTLCommandBuffer> cmd){
+            id<MTLComputeCommandEncoder> ec = [cmd computeCommandEncoder];
+            [ec setBuffer:B.nlStart offset:0 atIndex:0];
+            [ec setBuffer:B.nlId offset:0 atIndex:1];
+            [ec setBuffer:B.sPoints offset:0 atIndex:2];
+            [ec setBuffer:B.sVol offset:0 atIndex:3];
+            [ec setBuffer:B.density offset:0 atIndex:4];
+            [ec setBuffer:B.sOrig offset:0 atIndex:5];
+            [ec setBuffer:vel offset:0 atIndex:6];
+            [ec setBytes:&Ps length:sizeof(Ps) atIndex:7];
+            dispatch1d(ec, ctx.psoCohesionNl, (NSUInteger)N);
+            [ec endEncoding];
+        };
+
         // CSR pressure-accel / Jacobi-update encoders (read nlStart[i]..nlStart[i+1]).
         auto enc_accel = [&](id<MTLComputeCommandEncoder> enc){
             [enc setBuffer:B.nlStart offset:0 atIndex:0];
@@ -2037,7 +2194,7 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
             [enc setBuffer:B.pRho2   offset:0 atIndex:4];
             [enc setBuffer:B.accel   offset:0 atIndex:5];
             [enc setBytes:&Ps length:sizeof(Ps) atIndex:6];
-            dispatch1d(enc, ctx.psoPaNl, (NSUInteger)N);
+            dispatch_rows_simd(enc, ctx.psoPaNl, (NSUInteger)N);
         };
         auto enc_update = [&](id<MTLComputeCommandEncoder> enc){
             [enc setBuffer:B.nlStart   offset:0 atIndex:0];
@@ -2050,8 +2207,22 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
             [enc setBuffer:B.pRho2     offset:0 atIndex:7];
             [enc setBuffer:B.err       offset:0 atIndex:8];
             [enc setBytes:&Ps length:sizeof(Ps) atIndex:9];
-            dispatch1d(enc, ctx.psoPuNl, (NSUInteger)N);
+            dispatch_rows_simd(enc, ctx.psoPuNl, (NSUInteger)N);
         };
+        // Warm start: seed pRho2 (sorted order) from the caller's persistent
+        // pressure (caller order). Must be encoded after the grid scatter (needs
+        // sOrig) and before the first Jacobi accel (which reads pRho2) — command-
+        // buffer encode order plus Metal's hazard tracking guarantees both.
+        auto enc_gather = [&](id<MTLCommandBuffer> cmd){
+            id<MTLComputeCommandEncoder> eg = [cmd computeCommandEncoder];
+            [eg setBuffer:press offset:0 atIndex:0];
+            [eg setBuffer:B.sOrig offset:0 atIndex:1];
+            [eg setBuffer:B.pRho2 offset:0 atIndex:2];
+            [eg setBytes:&Pp length:sizeof(Pp) atIndex:3];
+            dispatch1d(eg, ctx.psoGatherF, (NSUInteger)N);
+            [eg endEncoding];
+        };
+
         // g Jacobi iterations (accel -> update). When zeroErr, B.err is cleared right
         // before the final update so a post-wait read is that iteration's density error.
         auto enc_jacobi = [&](id<MTLCommandBuffer> cmd, int g, bool zeroErr){
@@ -2065,7 +2236,9 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
                 id<MTLComputeCommandEncoder> eu = [cmd computeCommandEncoder]; enc_update(eu); [eu endEncoding];
             }
         };
-        // final accel from the converged p~, scattered into the caller's float3 buffer.
+        // final accel from the converged p~, scattered into the caller's float3
+        // buffer; a warm-start caller also gets the converged pressure scattered
+        // back so the next solve can seed from it.
         auto enc_final = [&](id<MTLCommandBuffer> cmd){
             id<MTLComputeCommandEncoder> ea = [cmd computeCommandEncoder]; enc_accel(ea); [ea endEncoding];
             id<MTLComputeCommandEncoder> ecp = [cmd computeCommandEncoder];
@@ -2075,59 +2248,171 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
             [ecp setBytes:&Ps length:sizeof(Ps) atIndex:3];
             dispatch1d(ecp, ctx.psoAccelScatter3, (NSUInteger)N);
             [ecp endEncoding];
+            if (press) {
+                id<MTLComputeCommandEncoder> ep = [cmd computeCommandEncoder];
+                [ep setBuffer:B.pRho2 offset:0 atIndex:0];
+                [ep setBuffer:B.sOrig offset:0 atIndex:1];
+                [ep setBuffer:press offset:0 atIndex:2];
+                [ep setBytes:&Ps length:sizeof(Ps) atIndex:3];
+                dispatch1d(ep, ctx.psoScatterF, (NSUInteger)N);
+                [ep endEncoding];
+            }
         };
 
         int maxIt = req.max_iterations > 0 ? req.max_iterations : 1;
         int minIt = req.min_iterations < 0 ? 0 : req.min_iterations;
         if (minIt > maxIt) minIt = maxIt;
         const bool earlyOut = (req.eta > 0.0f && minIt < maxIt);
+        int itersRun = 0;
 
-        // CB1: grid -> scatter -> neighbour count -> scan. One wait, then read the
-        // single word nlStart[N] (the pair total) and grow nlId/nlVgw to exactly
-        // that. CB1 has drained, so the realloc cannot race.
+        // ── CSR sizing. Slow path (first call / after growth): CB1 = grid ->
+        //    scatter -> neighbour count -> scan, one wait, read the one-word pair
+        //    total nlStart[N], size nlId/nlVgw to exactly that (CB1 has drained, so
+        //    the realloc cannot race). Fast path (steady state): the grow-only cache
+        //    already holds >= 1.5x the LAST solve's total, so the sizing wait is
+        //    skipped and the grid work is fused into the solve's command buffer.
+        //    Every CSR writer/reader clamps to nlCap (the allocation size), and the
+        //    total — read back after the solve's wait — exceeding the capacity means
+        //    the fluid gained >50% pair density in one substep (a regime change):
+        //    grow and redo from the fused build; the grid/scan results stay valid.
+        //    The redo re-seeds the pressure/err state, and XSPH/cohesion modify the
+        //    caller's velocity in place, so the fast path snapshots it up front and
+        //    the redo restores it — the retry then sees the exact original inputs. ──
+        const size_t capElems = B.nlId ? (B.nlId.length / sizeof(int)) : 0;
+        const bool fastPath = B.nlLastTotal > 0 &&
+                              capElems >= (size_t)B.nlLastTotal + (size_t)B.nlLastTotal / 2;
+
         auto build_and_size_nl = [&]{
             id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
             enc_grid_count(cmd);
             [cmd commit];
             [cmd waitUntilCompleted];
             const uint32_t tot = ((const uint32_t*)B.nlStart.contents)[N];
-            const size_t p = (size_t)(tot > 0 ? tot : 1);
+            // Allocate the 1.5x margin up front: a steady-state fluid (pair total
+            // roughly constant call-to-call) then qualifies for the single-CB fast
+            // path on every subsequent solve.
+            const size_t p = (size_t)(tot > 0 ? tot : 1) + (size_t)(tot / 2) + 1;
             ensure(dev, B.nlId,  sizeof(int)   * p);
             ensure(dev, B.nlVgw, sizeof(float) * 4 * p);
+            B.nlLastTotal = tot;
+            Pp.nlCap = Ps.nlCap = (uint32_t)(B.nlId.length / sizeof(int));
+            tBuild = pms(pt0, pnow());
         };
 
-        if (!earlyOut) {
-            // Two command buffers, two waits: CB1 sizes the CSR list; CB2 = fused
-            // build -> [XSPH] -> all Jacobi iterations -> final accel scatter.
-            build_and_size_nl();
-            tBuild = pms(pt0, pnow());
-            id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
+        // Everything after the grid: fused build -> [XSPH] -> [cohesion] ->
+        // [warm-start gather] -> g Jacobi iterations.
+        auto enc_solve_head = [&](id<MTLCommandBuffer> cmd, int g, bool zeroErr){
             enc_build(cmd);
-            if (doXsph) enc_xsph(cmd);
-            enc_jacobi(cmd, maxIt, /*zeroErr=*/false);
-            enc_final(cmd);
-            [cmd commit];
-            [cmd waitUntilCompleted];
-            tSolve = pms(pt0, pnow()) - tBuild;
-        } else {
-            // Early-out requested: the convergence readback forces splitting the Jacobi
-            // loop. CB1 sizes the list; the fused build (+XSPH) rides the first chunk's
-            // buffer; then chunked Jacobi (one wait per chunk) and the final scatter.
-            build_and_size_nl();
-            tBuild = pms(pt0, pnow());
-            const int kSolveChunk = 4;
-            int done = 0;
-            bool filled = false;
-            while (done < maxIt) {
-                int g = (maxIt - done < kSolveChunk) ? (maxIt - done) : kSolveChunk;
+            if (doXsph)     enc_xsph(cmd);
+            if (doCohesion) enc_cohesion(cmd);
+            if (press)      enc_gather(cmd);
+            enc_jacobi(cmd, g, zeroErr);
+        };
+        auto enc_vel_backup = [&](id<MTLCommandBuffer> cmd){
+            id<MTLBlitCommandEncoder> bl = [cmd blitCommandEncoder];
+            [bl copyFromBuffer:vel sourceOffset:0 toBuffer:B.velBackup destinationOffset:0
+                          size:sizeof(float) * 3 * (size_t)N];
+            [bl endEncoding];
+        };
+        auto fast_overflowed = [&]() -> bool {
+            const uint32_t tot = ((const uint32_t*)B.nlStart.contents)[N];
+            B.nlLastTotal = tot;
+            return (size_t)tot > (size_t)Pp.nlCap;
+        };
+        auto fast_recover = [&]{
+            const size_t p = (size_t)B.nlLastTotal + (size_t)(B.nlLastTotal / 2) + 1;  // keep the margin
+            ensure(dev, B.nlId,  sizeof(int) * p);
+            ensure(dev, B.nlVgw, sizeof(float) * 4 * p);
+            Pp.nlCap = Ps.nlCap = (uint32_t)(B.nlId.length / sizeof(int));
+            if (touchesVel) {
                 id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
-                if (!filled) { enc_build(cmd); if (doXsph) enc_xsph(cmd); filled = true; }
-                enc_jacobi(cmd, g, /*zeroErr=*/true);
+                id<MTLBlitCommandEncoder> bl = [cmd blitCommandEncoder];
+                [bl copyFromBuffer:B.velBackup sourceOffset:0 toBuffer:vel destinationOffset:0
+                              size:sizeof(float) * 3 * (size_t)N];
+                [bl endEncoding];
+                [cmd commit]; [cmd waitUntilCompleted];
+            }
+            if (!press) std::memset(B.pRho2.contents, 0, sizeof(float) * (size_t)N);
+            *(float*)B.err.contents = 0.0f;
+        };
+
+        if (fastPath) {
+            Pp.nlCap = Ps.nlCap = (uint32_t)capElems;
+            if (touchesVel) ensure(dev, B.velBackup, sizeof(float) * 3 * (size_t)N);
+        }
+
+        if (!earlyOut) {
+            if (fastPath) {
+                // ONE command buffer, ONE wait: grid + build + XSPH + all Jacobi
+                // iterations + final scatter (tBuild stays 0 — nothing to split).
+                id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
+                if (touchesVel) enc_vel_backup(cmd);
+                enc_grid_count(cmd);
+                enc_solve_head(cmd, maxIt, /*zeroErr=*/false);
+                enc_final(cmd);
                 [cmd commit];
                 [cmd waitUntilCompleted];
-                done += g;
-                double err = (double)(*(const float*)B.err.contents) / (double)N;
-                if (done >= minIt && err <= (double)req.eta) break;
+                if (fast_overflowed()) {
+                    fast_recover();
+                    id<MTLCommandBuffer> c2 = [ctx.queue commandBuffer];
+                    enc_solve_head(c2, maxIt, /*zeroErr=*/false);
+                    enc_final(c2);
+                    [c2 commit];
+                    [c2 waitUntilCompleted];
+                }
+            } else {
+                // Two command buffers, two waits: CB1 sizes the CSR list; CB2 =
+                // fused build -> [XSPH] -> all Jacobi iterations -> final scatter.
+                build_and_size_nl();
+                id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
+                enc_solve_head(cmd, maxIt, /*zeroErr=*/false);
+                enc_final(cmd);
+                [cmd commit];
+                [cmd waitUntilCompleted];
+            }
+            itersRun = maxIt;
+        } else {
+            // Early-out requested: the convergence readback forces splitting the
+            // Jacobi loop into chunks (one wait per chunk). The fused build (+XSPH
+            // + warm-start) rides the first chunk's buffer — and on the fast path
+            // that buffer carries the grid work too, so the first convergence wait
+            // doubles as the (post-hoc) sizing check.
+            const int kSolveChunk = 4;
+            int done = 0;
+            auto run_chunks = [&](bool buildInFirst){
+                bool filled = !buildInFirst;
+                while (done < maxIt) {
+                    int g = (maxIt - done < kSolveChunk) ? (maxIt - done) : kSolveChunk;
+                    id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
+                    if (!filled) { enc_solve_head(cmd, g, /*zeroErr=*/true); filled = true; }
+                    else         { enc_jacobi(cmd, g, /*zeroErr=*/true); }
+                    [cmd commit];
+                    [cmd waitUntilCompleted];
+                    done += g;
+                    double err = (double)(*(const float*)B.err.contents) / (double)N;
+                    if (done >= minIt && err <= (double)req.eta) break;
+                }
+            };
+            if (fastPath) {
+                int g = (maxIt < kSolveChunk) ? maxIt : kSolveChunk;
+                id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
+                if (touchesVel) enc_vel_backup(cmd);
+                enc_grid_count(cmd);
+                enc_solve_head(cmd, g, /*zeroErr=*/true);
+                [cmd commit];
+                [cmd waitUntilCompleted];
+                if (fast_overflowed()) {
+                    fast_recover();          // done is still 0: redo from the build
+                    run_chunks(/*buildInFirst=*/true);
+                } else {
+                    done = g;
+                    double err = (double)(*(const float*)B.err.contents) / (double)N;
+                    if (!(done >= minIt && err <= (double)req.eta))
+                        run_chunks(/*buildInFirst=*/false);
+                }
+            } else {
+                build_and_size_nl();
+                run_chunks(/*buildInFirst=*/true);
             }
             {
                 id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
@@ -2135,8 +2420,10 @@ bool metal_sph_solve_gpu(const MetalSphGpuRequest& req, std::string& error)
                 [cmd commit];
                 [cmd waitUntilCompleted];
             }
-            tSolve = pms(pt0, pnow()) - tBuild;
+            itersRun = done;
         }
+        if (req.iterations_out) *req.iterations_out = itersRun;
+        tSolve = pms(pt0, pnow()) - tBuild;
 
         // Leave no reusable cache behind: the resident grid/NL scratch is fluid-only,
         // sorted-space, and must not be picked up by a later host-pointer solve.
